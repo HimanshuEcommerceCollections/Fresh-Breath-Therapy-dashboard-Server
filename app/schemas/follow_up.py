@@ -34,3 +34,8 @@ class FollowUpResponse(ORMBase):
     completed_at: datetime | None
     created_at: datetime
     status: FollowUpStatus = FollowUpStatus.PENDING
+
+class FollowUpStats(BaseModel):
+    pending: int
+    overdue: int
+    completed: int

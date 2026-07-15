@@ -5,6 +5,10 @@ from app.schemas.base import ORMBase
 from app.models.enums import IntegrationStatus
 
 
+class IntegrationConnect(BaseModel):
+    credentials: dict | None = None
+
+
 class IntegrationResponse(ORMBase):
     id: uuid.UUID
     name: str
