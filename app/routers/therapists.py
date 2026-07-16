@@ -1,9 +1,9 @@
 import uuid
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
-
+from app.services.cloudinary_service import upload_avatar
 from app.database import get_db
 from app.models.therapist import Therapist
 from app.models.location import Location
@@ -102,3 +102,23 @@ async def delete_therapist(
 
     await db.delete(therapist)
     await db.commit()
+
+@router.post("/{therapist_id}/avatar", response_model=TherapistResponse)
+async def upload_therapist_avatar(
+    therapist_id: uuid.UUID,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin()),
+):
+    therapist = await db.get(Therapist, therapist_id)
+    if therapist is None:
+        raise HTTPException(status_code=404, detail="Therapist not found")
+
+    url = await upload_avatar(file, folder="fbt/therapists")
+    therapist.avatar_url = url
+    await db.commit()
+
+    result = await db.execute(
+        select(Therapist).options(selectinload(Therapist.location)).where(Therapist.id == therapist_id)
+    )
+    return result.scalar_one()

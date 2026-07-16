@@ -1,8 +1,12 @@
+from dotenv import load_dotenv
+load_dotenv()
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from app.database import AsyncSessionLocal
+from app.startup import ensure_auth_bootstrap
 from app.routers import (
     auth, locations, therapists, leads, clients, follow_up,
-    organization, roles, packages, feature_flags, integrations,
+    organization, roles, packages, feature_flags, integrations, payments
 )
 
 app = FastAPI(title="FBT Dashboard API")
@@ -26,6 +30,12 @@ app.include_router(roles.router)
 app.include_router(packages.router)
 app.include_router(feature_flags.router)
 app.include_router(integrations.router)
+app.include_router(payments.router)
+
+@app.on_event("startup")
+async def on_startup():
+    async with AsyncSessionLocal() as db:
+        await ensure_auth_bootstrap(db)
 
 @app.get("/health")
 async def health_check():
