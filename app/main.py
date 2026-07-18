@@ -6,7 +6,8 @@ from app.database import AsyncSessionLocal
 from app.startup import ensure_auth_bootstrap
 from app.routers import (
     auth, locations, therapists, leads, clients, follow_up,
-    organization, roles, packages, feature_flags, integrations, payments
+    organization, roles, packages, feature_flags, integrations, 
+    payments, reports
 )
 
 app = FastAPI(title="FBT Dashboard API")
@@ -31,6 +32,7 @@ app.include_router(packages.router)
 app.include_router(feature_flags.router)
 app.include_router(integrations.router)
 app.include_router(payments.router)
+app.include_router(reports.router)
 
 @app.on_event("startup")
 async def on_startup():

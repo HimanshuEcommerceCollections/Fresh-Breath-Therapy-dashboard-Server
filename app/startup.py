@@ -24,8 +24,8 @@ async def _ensure_roles(db: AsyncSession) -> dict[str, uuid.UUID]:
 
 async def _ensure_first_admin(db: AsyncSession, admin_role_id: uuid.UUID):
     result = await db.execute(select(User))
-    if result.scalar_one_or_none() is not None:
-        return  # a user already exists — never touch this again, ever
+    if result.first() is not None:
+        return  # at least one user already exists — never touch this again
 
     email = os.getenv("INITIAL_ADMIN_EMAIL")
     password = os.getenv("INITIAL_ADMIN_PASSWORD")
@@ -41,7 +41,6 @@ async def _ensure_first_admin(db: AsyncSession, admin_role_id: uuid.UUID):
         role_id=admin_role_id,
     ))
     print(f"Created initial admin user: {email}")
-
 
 async def ensure_auth_bootstrap(db: AsyncSession):
     """Runs exactly once per server process, at boot — NOT per request.
