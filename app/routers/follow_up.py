@@ -15,7 +15,8 @@ from app.schemas.follow_up import (
     FollowUpStatus,
 )
 from app.models.user import User
-from app.dependencies.auth import get_current_user, require_admin
+from app.models.therapist import Therapist
+from app.dependencies.auth import get_current_user, require_admin_or_coordinator, get_own_therapist
 
 router = APIRouter(prefix="/api/follow-ups", tags=["follow-ups"])
 
@@ -39,8 +40,16 @@ async def list_follow_ups(
     status_filter: FollowUpStatus | None = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    own_therapist: Therapist | None = Depends(get_own_therapist),
 ):
-    result = await db.execute(select(FollowUp).order_by(FollowUp.due_date))
+    query = select(FollowUp).order_by(FollowUp.due_date)
+    if own_therapist is not None:
+        query = query.where(
+            FollowUp.client_id.in_(
+                select(Client.id).where(Client.therapist_id == own_therapist.id)
+            )
+        )
+    result = await db.execute(query)
     follow_ups = result.scalars().all()
     responses = [_to_response(f) for f in follow_ups]
 
@@ -70,10 +79,15 @@ async def get_follow_up(
     follow_up_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    own_therapist: Therapist | None = Depends(get_own_therapist),
 ):
     follow_up = await db.get(FollowUp, follow_up_id)
     if follow_up is None:
         raise HTTPException(status_code=404, detail="Follow-up not found")
+    if own_therapist is not None:
+        client = await db.get(Client, follow_up.client_id)
+        if client is None or client.therapist_id != own_therapist.id:
+            raise HTTPException(status_code=404, detail="Follow-up not found")
     return _to_response(follow_up)
 
 
@@ -81,7 +95,7 @@ async def get_follow_up(
 async def create_follow_up(
     payload: FollowUpCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin()),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     client = await db.get(Client, payload.client_id)
     if client is None:
@@ -99,7 +113,7 @@ async def update_follow_up(
     follow_up_id: uuid.UUID,
     payload: FollowUpUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin()),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     follow_up = await db.get(FollowUp, follow_up_id)
     if follow_up is None:
@@ -117,7 +131,7 @@ async def update_follow_up(
 async def complete_follow_up(
     follow_up_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin()),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     follow_up = await db.get(FollowUp, follow_up_id)
     if follow_up is None:
@@ -133,7 +147,7 @@ async def complete_follow_up(
 async def delete_follow_up(
     follow_up_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin()),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     follow_up = await db.get(FollowUp, follow_up_id)
     if follow_up is None:

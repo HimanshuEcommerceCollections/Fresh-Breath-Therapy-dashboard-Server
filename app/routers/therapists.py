@@ -100,6 +100,12 @@ async def delete_therapist(
     if therapist is None:
         raise HTTPException(status_code=404, detail="Therapist not found")
 
+    if therapist.ever_linked:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot delete a therapist record that has ever been linked to a user login — this preserves historical session/payment data",
+        )
+
     await db.delete(therapist)
     await db.commit()
 

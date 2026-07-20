@@ -14,7 +14,7 @@ from app.models.session import Session as SessionModel
 from app.models.enums import ClientStatus
 from app.schemas.client import ClientCreate, ClientUpdate, ClientResponse
 from app.models.user import User
-from app.dependencies.auth import get_current_user, require_admin
+from app.dependencies.auth import get_current_user, require_admin_or_coordinator, get_own_therapist
 
 router = APIRouter(prefix="/api/clients", tags=["clients"])
 
@@ -62,9 +62,12 @@ async def list_clients(
     search: str | None = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    own_therapist: Therapist | None = Depends(get_own_therapist),
 ):
     query = _client_query()
 
+    if own_therapist is not None:
+        query = query.where(Client.therapist_id == own_therapist.id)
     if status_filter:
         query = query.where(Client.status == status_filter)
     if location_id:
@@ -83,10 +86,13 @@ async def get_client(
     client_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    own_therapist: Therapist | None = Depends(get_own_therapist),
 ):
     result = await db.execute(_client_query().where(Client.id == client_id))
     client = result.scalar_one_or_none()
     if client is None:
+        raise HTTPException(status_code=404, detail="Client not found")
+    if own_therapist is not None and client.therapist_id != own_therapist.id:
         raise HTTPException(status_code=404, detail="Client not found")
 
     responses = await _attach_computed_fields(db, [client])
@@ -97,7 +103,7 @@ async def get_client(
 async def create_client(
     payload: ClientCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin()),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     location = await db.get(Location, payload.location_id)
     if location is None:
@@ -122,7 +128,7 @@ async def update_client(
     client_id: uuid.UUID,
     payload: ClientUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin()),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     client = await db.get(Client, client_id)
     if client is None:
@@ -155,7 +161,7 @@ async def update_client(
 async def delete_client(
     client_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin()),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     client = await db.get(Client, client_id)
     if client is None:

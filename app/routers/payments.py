@@ -11,7 +11,7 @@ from app.models.client import Client
 from app.models.package import Package
 from app.schemas.payment import PaymentCreate, PaymentUpdate, PaymentResponse
 from app.models.user import User
-from app.dependencies.auth import get_current_user, require_admin
+from app.dependencies.auth import get_current_user, require_admin_or_coordinator
 
 router = APIRouter(prefix="/api/payments", tags=["payments"])
 
@@ -56,7 +56,7 @@ async def get_payment(
 async def create_payment(
     payload: PaymentCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin()),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     client = await db.get(Client, payload.client_id)
     if client is None:
@@ -79,7 +79,7 @@ async def update_payment(
     payment_id: uuid.UUID,
     payload: PaymentUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin()),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     payment = await db.get(Payment, payment_id)
     if payment is None:
@@ -97,7 +97,7 @@ async def update_payment(
 async def delete_payment(
     payment_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin()),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     payment = await db.get(Payment, payment_id)
     if payment is None:
