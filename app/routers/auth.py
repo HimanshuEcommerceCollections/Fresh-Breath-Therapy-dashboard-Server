@@ -6,6 +6,7 @@ from sqlalchemy.orm import selectinload
 from app.database import get_db
 from app.models.user import User
 from app.models.role import Role
+from app.models.therapist import Therapist
 from app.schemas.auth import LoginRequest, LoginResponse
 from app.schemas.user import UserCreate, UserResponse
 from app.services.security import verify_password, hash_password
@@ -118,6 +119,25 @@ async def approve_role_request(
         raise HTTPException(status_code=400, detail="Role does not exist")
 
     target_user = await db.get(User, req.user_id)
+
+    if role.name == "Therapist":
+        result = await db.execute(
+            select(Therapist).where(Therapist.email == target_user.email)
+        )
+        therapist = result.scalar_one_or_none()
+        if therapist is None:
+            raise HTTPException(
+                status_code=400,
+                detail="No therapist record found with this email. Please create a therapist record with this email before approving this request.",
+            )
+        if therapist.user_id is not None and therapist.user_id != target_user.id:
+            raise HTTPException(
+                status_code=400,
+                detail="This therapist record is already linked to another user account.",
+            )
+        therapist.user_id = target_user.id
+        therapist.ever_linked = True
+
     target_user.role_id = role.id
 
     req.requested_role_id = role.id
