@@ -63,15 +63,20 @@ async def get_own_therapist(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> Therapist | None:
-    if current_user.role.name != "Therapist":
-        return None
+    """Return the Therapist row linked to the current user, for any role.
 
+    Only Therapist-role users REQUIRE a link (403 without one) — for them,
+    callers row-filter down to this record. Admin/Coordinator may also have
+    a linked record (an optional "my own" view) but are never row-filtered:
+    gate filtering on current_user.role.name == "Therapist", not on this
+    returning a value.
+    """
     result = await db.execute(
         select(Therapist).where(Therapist.user_id == current_user.id)
     )
     therapist = result.scalar_one_or_none()
 
-    if therapist is None:
+    if therapist is None and current_user.role.name == "Therapist":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="No therapist record linked to this account",

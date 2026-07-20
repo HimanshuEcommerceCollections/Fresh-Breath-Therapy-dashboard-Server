@@ -1,6 +1,6 @@
 import uuid
 from decimal import Decimal
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -12,6 +12,7 @@ from app.models.package import Package
 from app.schemas.payment import PaymentCreate, PaymentUpdate, PaymentResponse
 from app.models.user import User
 from app.dependencies.auth import get_current_user, require_admin_or_coordinator
+from app.dependencies.idempotency import idempotent
 
 router = APIRouter(prefix="/api/payments", tags=["payments"])
 
@@ -53,8 +54,10 @@ async def get_payment(
 
 
 @router.post("", response_model=PaymentResponse, status_code=status.HTTP_201_CREATED)
+@idempotent(PaymentResponse, status_code=status.HTTP_201_CREATED)
 async def create_payment(
     payload: PaymentCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_admin_or_coordinator()),
 ):

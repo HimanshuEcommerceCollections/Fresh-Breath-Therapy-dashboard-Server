@@ -1,6 +1,6 @@
 import uuid
 from decimal import Decimal
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, func
 from sqlalchemy.orm import selectinload
@@ -15,6 +15,7 @@ from app.models.enums import ClientStatus
 from app.schemas.client import ClientCreate, ClientUpdate, ClientResponse
 from app.models.user import User
 from app.dependencies.auth import get_current_user, require_admin_or_coordinator, get_own_therapist
+from app.dependencies.idempotency import idempotent
 
 router = APIRouter(prefix="/api/clients", tags=["clients"])
 
@@ -66,7 +67,7 @@ async def list_clients(
 ):
     query = _client_query()
 
-    if own_therapist is not None:
+    if current_user.role.name == "Therapist":
         query = query.where(Client.therapist_id == own_therapist.id)
     if status_filter:
         query = query.where(Client.status == status_filter)
@@ -92,7 +93,7 @@ async def get_client(
     client = result.scalar_one_or_none()
     if client is None:
         raise HTTPException(status_code=404, detail="Client not found")
-    if own_therapist is not None and client.therapist_id != own_therapist.id:
+    if current_user.role.name == "Therapist" and client.therapist_id != own_therapist.id:
         raise HTTPException(status_code=404, detail="Client not found")
 
     responses = await _attach_computed_fields(db, [client])
@@ -100,8 +101,10 @@ async def get_client(
 
 
 @router.post("", response_model=ClientResponse, status_code=status.HTTP_201_CREATED)
+@idempotent(ClientResponse, status_code=status.HTTP_201_CREATED)
 async def create_client(
     payload: ClientCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_admin_or_coordinator()),
 ):

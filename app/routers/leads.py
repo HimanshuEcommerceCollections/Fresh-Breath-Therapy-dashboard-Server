@@ -1,5 +1,5 @@
 import uuid
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_
 from sqlalchemy.orm import selectinload
@@ -12,6 +12,7 @@ from app.models.enums import LeadStatus
 from app.schemas.lead import LeadCreate, LeadUpdate, LeadResponse
 from app.models.user import User
 from app.dependencies.auth import get_current_user, require_admin_or_coordinator, get_own_therapist
+from app.dependencies.idempotency import idempotent
 
 router = APIRouter(prefix="/api/leads", tags=["leads"])
 
@@ -34,7 +35,7 @@ async def list_leads(
 ):
     query = _lead_query()
 
-    if own_therapist is not None:
+    if current_user.role.name == "Therapist":
         query = query.where(Lead.therapist_id == own_therapist.id)
     if status_filter:
         query = query.where(Lead.status == status_filter)
@@ -61,14 +62,16 @@ async def get_lead(
     lead = result.scalar_one_or_none()
     if lead is None:
         raise HTTPException(status_code=404, detail="Lead not found")
-    if own_therapist is not None and lead.therapist_id != own_therapist.id:
+    if current_user.role.name == "Therapist" and lead.therapist_id != own_therapist.id:
         raise HTTPException(status_code=404, detail="Lead not found")
     return lead
 
 
 @router.post("", response_model=LeadResponse, status_code=status.HTTP_201_CREATED)
+@idempotent(LeadResponse, status_code=status.HTTP_201_CREATED)
 async def create_lead(
     payload: LeadCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_admin_or_coordinator()),
 ):

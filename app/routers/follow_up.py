@@ -43,7 +43,7 @@ async def list_follow_ups(
     own_therapist: Therapist | None = Depends(get_own_therapist),
 ):
     query = select(FollowUp).order_by(FollowUp.due_date)
-    if own_therapist is not None:
+    if current_user.role.name == "Therapist":
         query = query.where(
             FollowUp.client_id.in_(
                 select(Client.id).where(Client.therapist_id == own_therapist.id)
@@ -84,7 +84,7 @@ async def get_follow_up(
     follow_up = await db.get(FollowUp, follow_up_id)
     if follow_up is None:
         raise HTTPException(status_code=404, detail="Follow-up not found")
-    if own_therapist is not None:
+    if current_user.role.name == "Therapist":
         client = await db.get(Client, follow_up.client_id)
         if client is None or client.therapist_id != own_therapist.id:
             raise HTTPException(status_code=404, detail="Follow-up not found")
