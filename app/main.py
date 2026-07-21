@@ -7,7 +7,7 @@ from app.startup import ensure_auth_bootstrap
 from app.routers import (
     auth, locations, therapists, leads, clients, follow_up,
     organization, roles, packages, feature_flags, integrations, 
-    payments, reports, oauth_google, uploads
+    payments, reports, oauth_google, uploads, sessions, dashboard, pto
 )
 
 app = FastAPI(title="FBT Dashboard API")
@@ -35,6 +35,9 @@ app.include_router(payments.router)
 app.include_router(reports.router)
 app.include_router(oauth_google.router)
 app.include_router(uploads.router)
+app.include_router(sessions.router)
+app.include_router(dashboard.router)
+app.include_router(pto.router)
 
 @app.on_event("startup")
 async def on_startup():
