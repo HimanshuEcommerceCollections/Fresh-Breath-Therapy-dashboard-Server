@@ -1,5 +1,5 @@
 import uuid
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_
 from sqlalchemy.orm import selectinload
@@ -11,7 +11,8 @@ from app.models.therapist import Therapist
 from app.models.enums import LeadStatus
 from app.schemas.lead import LeadCreate, LeadUpdate, LeadResponse
 from app.models.user import User
-from app.dependencies.auth import get_current_user, require_admin
+from app.dependencies.auth import get_current_user, require_admin_or_coordinator, get_own_therapist
+from app.dependencies.idempotency import idempotent
 
 router = APIRouter(prefix="/api/leads", tags=["leads"])
 
@@ -30,9 +31,12 @@ async def list_leads(
     search: str | None = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    own_therapist: Therapist | None = Depends(get_own_therapist),
 ):
     query = _lead_query()
 
+    if current_user.role.name == "Therapist":
+        query = query.where(Lead.therapist_id == own_therapist.id)
     if status_filter:
         query = query.where(Lead.status == status_filter)
     if location_id:
@@ -52,19 +56,24 @@ async def get_lead(
     lead_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    own_therapist: Therapist | None = Depends(get_own_therapist),
 ):
     result = await db.execute(_lead_query().where(Lead.id == lead_id))
     lead = result.scalar_one_or_none()
     if lead is None:
         raise HTTPException(status_code=404, detail="Lead not found")
+    if current_user.role.name == "Therapist" and lead.therapist_id != own_therapist.id:
+        raise HTTPException(status_code=404, detail="Lead not found")
     return lead
 
 
 @router.post("", response_model=LeadResponse, status_code=status.HTTP_201_CREATED)
+@idempotent(LeadResponse, status_code=status.HTTP_201_CREATED)
 async def create_lead(
     payload: LeadCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin()),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     location = await db.get(Location, payload.location_id)
     if location is None:
@@ -88,7 +97,7 @@ async def update_lead(
     lead_id: uuid.UUID,
     payload: LeadUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin()),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     lead = await db.get(Lead, lead_id)
     if lead is None:
@@ -119,7 +128,7 @@ async def update_lead(
 async def delete_lead(
     lead_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin()),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     lead = await db.get(Lead, lead_id)
     if lead is None:

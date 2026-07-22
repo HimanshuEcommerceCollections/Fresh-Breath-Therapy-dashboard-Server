@@ -1,17 +1,20 @@
 import uuid
 from decimal import Decimal
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
-
+from app.services.notification_service import create_notification
+from app.models.notification import NotificationCategory, NotificationBadge
+from app.models.enums import PaymentStatus
 from app.database import get_db
 from app.models.payment import Payment
 from app.models.client import Client
 from app.models.package import Package
 from app.schemas.payment import PaymentCreate, PaymentUpdate, PaymentResponse
 from app.models.user import User
-from app.dependencies.auth import get_current_user, require_admin
+from app.dependencies.auth import get_current_user, require_admin_or_coordinator
+from app.dependencies.idempotency import idempotent
 
 router = APIRouter(prefix="/api/payments", tags=["payments"])
 
@@ -53,10 +56,12 @@ async def get_payment(
 
 
 @router.post("", response_model=PaymentResponse, status_code=status.HTTP_201_CREATED)
+@idempotent(PaymentResponse, status_code=status.HTTP_201_CREATED)
 async def create_payment(
     payload: PaymentCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin()),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     client = await db.get(Client, payload.client_id)
     if client is None:
@@ -79,25 +84,37 @@ async def update_payment(
     payment_id: uuid.UUID,
     payload: PaymentUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin()),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     payment = await db.get(Payment, payment_id)
     if payment is None:
         raise HTTPException(status_code=404, detail="Payment not found")
 
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    update_data = payload.model_dump(exclude_unset=True)
+    previously_overdue = payment.status == PaymentStatus.OVERDUE
+
+    for field, value in update_data.items():
         setattr(payment, field, value)
+
+    if payment.status == PaymentStatus.OVERDUE and not previously_overdue:
+        client = await db.get(Client, payment.client_id)
+        await create_notification(
+            db, NotificationCategory.PAYMENT_DUE, NotificationBadge.OVERDUE,
+            title="Payment overdue",
+            body=f"Payment for {client.name if client else 'a client'} is overdue.",
+            therapist_id=getattr(client, "therapist_id", None),
+            related_entity_type="payment", related_entity_id=payment.id, commit=False,
+        )
 
     await db.commit()
     result = await db.execute(_payment_query().where(Payment.id == payment_id))
     return _to_response(result.scalar_one())
 
-
 @router.delete("/{payment_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_payment(
     payment_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin()),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     payment = await db.get(Payment, payment_id)
     if payment is None:
