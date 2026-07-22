@@ -11,6 +11,8 @@ from app.models.enums import SessionStatus
 from app.schemas.session import (
     SessionCreate, SessionUpdate, SessionSearchRequest, SessionResponse, TERMINAL_STATUSES,
 )
+from app.services.notification_service import create_notification
+from app.models.notification import NotificationCategory, NotificationBadge
 from app.models.user import User
 from app.dependencies.auth import get_current_user, require_admin, require_admin_or_coordinator, get_own_therapist
 from app.services.session_service import check_double_booking
@@ -135,6 +137,14 @@ async def update_session(
 
     if session.status == SessionStatus.COMPLETED and not previously_completed:
         await accrue_pto_for_completed_session(db, session.id, session.therapist_id)
+
+    if update_data.get("status") == SessionStatus.NO_SHOW:
+        await create_notification(
+            db, NotificationCategory.MISSED_SESSION, NotificationBadge.OVERDUE,
+            title="Missed session", body="A session was marked as no-show.",
+            therapist_id=session.therapist_id,
+            related_entity_type="session", related_entity_id=session.id, commit=False,
+        )
 
     await db.commit()
 
