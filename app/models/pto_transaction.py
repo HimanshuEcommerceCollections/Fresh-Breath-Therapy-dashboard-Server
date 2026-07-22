@@ -1,12 +1,13 @@
 import uuid
-from datetime import datetime
+from datetime import datetime, date
 from sqlalchemy import Numeric, DateTime, ForeignKey, Enum, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID
-
+from sqlalchemy import Date, String
+from app.models.therapist import Therapist
+from app.models.session import Session
 from app.database import Base
 from app.models.enums import PtoTransactionType
-
 
 class PtoTransaction(Base):
     __tablename__ = "pto_transactions"
@@ -36,3 +37,5 @@ class PtoTransaction(Base):
 
     therapist: Mapped["Therapist"] = relationship()
     source_session: Mapped["Session | None"] = relationship()
+    date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    reason: Mapped[str | None] = mapped_column(String, nullable=True)

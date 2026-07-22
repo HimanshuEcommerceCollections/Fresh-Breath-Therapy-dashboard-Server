@@ -12,7 +12,7 @@ async def _ensure_roles(db: AsyncSession) -> dict[str, uuid.UUID]:
     result = await db.execute(select(Role))
     existing = {r.name: r.id for r in result.scalars().all()}
 
-    for name, permissions in [("Admin", {"can_edit": True}), ("Viewer", {"can_edit": False})]:
+    for name, permissions in [("Admin", {"can_edit": True}), ("Coordinator", {"can_edit": False}), ("Therapist", {"can_edit": False})]:
         if name not in existing:
             role = Role(id=uuid.uuid4(), name=name, permissions=permissions)
             db.add(role)

@@ -53,6 +53,20 @@ async def create_therapist(
         raise HTTPException(status_code=400, detail="Location does not exist")
 
     therapist = Therapist(id=uuid.uuid4(), **payload.model_dump())
+
+    # Best-effort reverse linking: if a user account already exists with this
+    # email and isn't linked to another therapist record, link it now. Never
+    # blocks creation, and never grants or changes the user's role.
+    result = await db.execute(select(User).where(User.email == payload.email))
+    user = result.scalar_one_or_none()
+    if user is not None:
+        existing_link = await db.execute(
+            select(Therapist).where(Therapist.user_id == user.id)
+        )
+        if existing_link.scalar_one_or_none() is None:
+            therapist.user_id = user.id
+            therapist.ever_linked = True
+
     db.add(therapist)
     await db.commit()
 
@@ -99,6 +113,12 @@ async def delete_therapist(
     therapist = await db.get(Therapist, therapist_id)
     if therapist is None:
         raise HTTPException(status_code=404, detail="Therapist not found")
+
+    if therapist.ever_linked:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot delete a therapist record that has ever been linked to a user login — this preserves historical session/payment data",
+        )
 
     await db.delete(therapist)
     await db.commit()

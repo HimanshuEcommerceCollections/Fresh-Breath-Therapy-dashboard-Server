@@ -13,3 +13,7 @@ from app.models.feature_flag import FeatureFlag
 from app.models.integration import Integration
 from app.models.organization_settings import OrganizationSettings
 from app.models.role_request import RoleRequest
+from app.models.otp_code import OtpCode
+from app.models.idempotency_key import IdempotencyKey
+from app.models.notification import Notification
+from app.models.client_message import ClientMessage
