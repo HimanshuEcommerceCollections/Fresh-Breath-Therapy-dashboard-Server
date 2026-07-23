@@ -8,11 +8,14 @@ from app.database import get_db
 from app.models.lead import Lead
 from app.models.location import Location
 from app.models.therapist import Therapist
+from app.models.client import Client
 from app.models.enums import LeadStatus
 from app.schemas.lead import LeadCreate, LeadUpdate, LeadResponse
+from app.schemas.client import ClientResponse
 from app.models.user import User
 from app.dependencies.auth import get_current_user, require_admin_or_coordinator, get_own_therapist
 from app.dependencies.idempotency import idempotent
+from app.routers.clients import _client_query, _attach_computed_fields
 
 router = APIRouter(prefix="/api/leads", tags=["leads"])
 
@@ -136,3 +139,36 @@ async def delete_lead(
 
     await db.delete(lead)
     await db.commit()
+
+
+@router.post("/{lead_id}/convert", response_model=ClientResponse, status_code=status.HTTP_201_CREATED)
+@idempotent(ClientResponse, status_code=status.HTTP_201_CREATED)
+async def convert_lead(
+    lead_id: uuid.UUID,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin_or_coordinator()),
+):
+    lead = await db.get(Lead, lead_id)
+    if lead is None:
+        raise HTTPException(status_code=400, detail="Lead does not exist")
+    if lead.converted_client_id is not None:
+        raise HTTPException(status_code=400, detail="Lead is already converted")
+    if lead.therapist_id is None:
+        raise HTTPException(status_code=400, detail="Lead has no therapist assigned")
+
+    client = Client(
+        id=uuid.uuid4(),
+        name=lead.name,
+        email=lead.email,
+        therapist_id=lead.therapist_id,
+        location_id=lead.location_id,
+    )
+    db.add(client)
+    lead.converted_client_id = client.id
+    await db.commit()
+
+    result = await db.execute(_client_query().where(Client.id == client.id))
+    saved = result.scalar_one()
+    responses = await _attach_computed_fields(db, [saved])
+    return responses[0]
