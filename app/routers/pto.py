@@ -15,6 +15,7 @@ from app.schemas.pto import PtoDashboardResponse, PtoStats, LocationPtoPoint, Le
 from app.schemas.pto_transaction import PtoUsageCreate, PtoTransactionResponse
 from app.models.user import User
 from app.dependencies.auth import require_admin_or_coordinator, require_admin
+from app.services.pto_service import get_pto_balances_by_therapist, get_ytd_completed_sessions_by_therapist
 
 router = APIRouter(prefix="/api/pto", tags=["pto"])
 
@@ -83,22 +84,10 @@ async def get_pto_dashboard(
     )).all()
 
     # Query 8: YTD completed sessions per therapist, one grouped query
-    year_start = date(date.today().year, 1, 1)
-    ytd_rows = (await db.execute(
-        select(SessionModel.therapist_id, func.count(SessionModel.id))
-        .where(SessionModel.status == SessionStatus.COMPLETED, SessionModel.date >= year_start)
-        .group_by(SessionModel.therapist_id)
-    )).all()
-    ytd_by_therapist = {row[0]: row[1] for row in ytd_rows}
+    ytd_by_therapist = await get_ytd_completed_sessions_by_therapist(db)
 
     # Query 9: accrued+used PTO per therapist, one grouped query
-    pto_per_therapist_rows = (await db.execute(
-        select(PtoTransaction.therapist_id, PtoTransaction.type, func.coalesce(func.sum(PtoTransaction.hours), 0))
-        .group_by(PtoTransaction.therapist_id, PtoTransaction.type)
-    )).all()
-    pto_per_therapist: dict[uuid.UUID, dict] = {}
-    for therapist_id, ptype, hours in pto_per_therapist_rows:
-        pto_per_therapist.setdefault(therapist_id, {})[ptype] = Decimal(str(hours))
+    pto_per_therapist = await get_pto_totals_by_therapist(db)
 
     leaderboard_raw = []
     for therapist, location_name in therapists:

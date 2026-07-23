@@ -1,4 +1,5 @@
 import uuid
+from decimal import Decimal
 from pydantic import BaseModel, EmailStr
 from app.schemas.base import ORMBase
 from app.schemas.location import LocationResponse
@@ -29,3 +30,7 @@ class TherapistResponse(ORMBase):
     avatar_url: str | None
     is_active: bool
     location: LocationResponse
+    active_client_count: int = 0
+    revenue: Decimal = Decimal("0")
+    ytd_sessions: int = 0
+    pto_balance: Decimal = Decimal("0")

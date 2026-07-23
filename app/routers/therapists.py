@@ -1,17 +1,59 @@
 import uuid
+from decimal import Decimal
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 from app.services.cloudinary_service import upload_avatar
+from app.services.pto_service import get_pto_balances_by_therapist, get_ytd_completed_sessions_by_therapist
 from app.database import get_db
 from app.models.therapist import Therapist
 from app.models.location import Location
+from app.models.client import Client
+from app.models.payment import Payment
+from app.models.enums import ClientStatus
 from app.schemas.therapist import TherapistCreate, TherapistUpdate, TherapistResponse
 from app.models.user import User
 from app.dependencies.auth import get_current_user, require_admin
 
 router = APIRouter(prefix="/api/therapists", tags=["therapists"])
+
+ACTIVE_CLIENT_STATUSES = (ClientStatus.THERAPY_SESSION_BOOKED, ClientStatus.ONGOING_THERAPY)
+
+
+async def _attach_computed_fields(db: AsyncSession, therapists: list[Therapist]) -> list[TherapistResponse]:
+    if not therapists:
+        return []
+
+    therapist_ids = [t.id for t in therapists]
+
+    active_client_rows = (await db.execute(
+        select(Client.therapist_id, func.count(Client.id))
+        .where(Client.therapist_id.in_(therapist_ids), Client.status.in_(ACTIVE_CLIENT_STATUSES))
+        .group_by(Client.therapist_id)
+    )).all()
+    active_clients_by_therapist = {row[0]: row[1] for row in active_client_rows}
+
+    revenue_rows = (await db.execute(
+        select(Client.therapist_id, func.coalesce(func.sum(Payment.paid), 0))
+        .join(Payment, Payment.client_id == Client.id)
+        .where(Client.therapist_id.in_(therapist_ids))
+        .group_by(Client.therapist_id)
+    )).all()
+    revenue_by_therapist = {row[0]: Decimal(str(row[1])) for row in revenue_rows}
+
+    ytd_by_therapist = await get_ytd_completed_sessions_by_therapist(db)
+    pto_balance_by_therapist = await get_pto_balances_by_therapist(db)
+
+    responses = []
+    for therapist in therapists:
+        response = TherapistResponse.model_validate(therapist)
+        response.active_client_count = active_clients_by_therapist.get(therapist.id, 0)
+        response.revenue = revenue_by_therapist.get(therapist.id, Decimal("0"))
+        response.ytd_sessions = ytd_by_therapist.get(therapist.id, 0)
+        response.pto_balance = pto_balance_by_therapist.get(therapist.id, Decimal("0"))
+        responses.append(response)
+    return responses
 
 
 @router.get("", response_model=list[TherapistResponse])
@@ -24,7 +66,8 @@ async def list_therapists(
     if location_id:
         query = query.where(Therapist.location_id == location_id)
     result = await db.execute(query.order_by(Therapist.name))
-    return result.scalars().all()
+    therapists = result.scalars().all()
+    return await _attach_computed_fields(db, therapists)
 
 
 @router.get("/{therapist_id}", response_model=TherapistResponse)
@@ -39,7 +82,8 @@ async def get_therapist(
     therapist = result.scalar_one_or_none()
     if therapist is None:
         raise HTTPException(status_code=404, detail="Therapist not found")
-    return therapist
+    responses = await _attach_computed_fields(db, [therapist])
+    return responses[0]
 
 
 @router.post("", response_model=TherapistResponse, status_code=status.HTTP_201_CREATED)
