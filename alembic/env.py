@@ -62,7 +62,7 @@ def run_migrations_online() -> None:
 
     """
     config.set_main_option(
-        "sqlalchemy.url", settings.DATABASE_URL.replace("+asyncpg", "")
+        "sqlalchemy.url", settings.DATABASE_URL.replace("+asyncpg", "").replace("%", "%%"),
     )
 
     connectable = engine_from_config(
