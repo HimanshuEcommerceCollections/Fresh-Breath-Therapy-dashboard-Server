@@ -7,7 +7,7 @@ from fastapi import HTTPException
 
 from app.models.otp_code import OtpCode
 from app.services.security import hash_password, verify_password
-from app.services.email_service import send_otp_email
+from app.services.email_queue import email_queue
 
 OTP_TTL_MINUTES = 5
 RESEND_COOLDOWN_MINUTES = 5
@@ -49,7 +49,7 @@ async def request_otp(db: AsyncSession, user_id: uuid.UUID, email: str, purpose:
         ))
 
     await db.commit()
-    await send_otp_email(email, code)
+    await email_queue.put((email, code))
     return expires_at
 
 
