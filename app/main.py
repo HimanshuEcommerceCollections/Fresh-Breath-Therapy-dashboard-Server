@@ -2,6 +2,7 @@ from dotenv import load_dotenv
 load_dotenv()
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from app.config import settings
 from app.database import AsyncSessionLocal
 from app.startup import ensure_auth_bootstrap
 from app.routers import (
@@ -14,9 +15,11 @@ from app.services.scheduler_service import start_scheduler
 
 app = FastAPI(title="FBT Dashboard API")
 
+allowed_origins = [origin.strip() for origin in settings.ALLOWED_ORIGINS.split(",") if origin.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
