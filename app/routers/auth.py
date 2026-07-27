@@ -69,8 +69,8 @@ async def verify_login_otp(
         key="access_token",
         value=token,
         httponly=True,
-        samesite="lax",
-        secure=False,
+        samesite="none",
+        secure=True,
         max_age=60 * 60,
     )
     return VerifyOtpResponse(detail="Login successful")

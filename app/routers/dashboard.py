@@ -106,15 +106,16 @@ async def get_dashboard(
     )
 
     # Revenue trend — one grouped query
+    month_expr = func.to_char(Payment.date, "YYYY-MM").label("month")
     trend_rows = (await db.execute(
         select(
-            func.to_char(Payment.date, "YYYY-MM"),
+            month_expr,
             func.coalesce(func.sum(Payment.paid), 0),
             func.coalesce(func.sum(Payment.due - Payment.paid), 0),
         )
         .where(Payment.date >= six_months_ago)
-        .group_by(func.to_char(Payment.date, "YYYY-MM"))
-        .order_by(func.to_char(Payment.date, "YYYY-MM"))
+        .group_by(month_expr)
+        .order_by(month_expr)
     )).all()
     revenue_trend = [
         RevenueTrendPoint(month=row[0], collected=row[1], pending=row[2]) for row in trend_rows
