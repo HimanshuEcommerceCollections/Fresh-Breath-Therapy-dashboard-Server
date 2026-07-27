@@ -12,6 +12,7 @@ from app.routers import (
     pto, notifications, client_messages
 )
 from app.services.scheduler_service import start_scheduler
+from app.services.email_queue import start_email_worker
 
 app = FastAPI(title="FBT Dashboard API")
 
@@ -49,6 +50,10 @@ app.include_router(client_messages.router)
 @app.on_event("startup")
 async def _start_scheduler():
     start_scheduler()
+
+@app.on_event("startup")
+async def _start_email_worker():
+    start_email_worker()
 
 @app.on_event("startup")
 async def on_startup():
