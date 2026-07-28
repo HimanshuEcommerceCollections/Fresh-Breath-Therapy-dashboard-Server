@@ -10,7 +10,7 @@ from app.services.security import hash_password, verify_password
 from app.services.email_queue import email_queue
 
 OTP_TTL_MINUTES = 5
-RESEND_COOLDOWN_MINUTES = 5
+RESEND_COOLDOWN_SECONDS = 5  # TODO: revert to 5-minute cooldown (RESEND_COOLDOWN_MINUTES = 5) after testing
 
 
 def _generate_code() -> str:
@@ -28,8 +28,8 @@ async def request_otp(db: AsyncSession, user_id: uuid.UUID, email: str, purpose:
     )
     existing = result.scalar_one_or_none()
 
-    if existing and existing.last_sent_at + timedelta(minutes=RESEND_COOLDOWN_MINUTES) > now:
-        wait_seconds = int((existing.last_sent_at + timedelta(minutes=RESEND_COOLDOWN_MINUTES) - now).total_seconds())
+    if existing and existing.last_sent_at + timedelta(seconds=RESEND_COOLDOWN_SECONDS) > now:
+        wait_seconds = int((existing.last_sent_at + timedelta(seconds=RESEND_COOLDOWN_SECONDS) - now).total_seconds())
         raise HTTPException(
             status_code=429,
             detail=f"An OTP was already sent. Please wait {wait_seconds} seconds before requesting another.",

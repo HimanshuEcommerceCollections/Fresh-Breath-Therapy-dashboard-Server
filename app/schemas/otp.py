@@ -4,7 +4,8 @@ from pydantic import BaseModel, EmailStr
 
 class OtpRequestResponse(BaseModel):
     detail: str = "OTP sent"
-    expires_at: datetime
+    expires_at: datetime | None = None
+    otp_required: bool = True
 
 
 class VerifyOtpRequest(BaseModel):

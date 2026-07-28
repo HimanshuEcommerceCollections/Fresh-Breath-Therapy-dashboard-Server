@@ -18,8 +18,21 @@ from app.models.role_request import RoleRequest, RoleRequestStatus
 from app.schemas.role_request import SignupRequest, ApproveRoleRequest, RoleRequestResponse
 from app.services.otp_service import request_otp, verify_otp
 from app.schemas.otp import OtpRequestResponse, VerifyOtpRequest, VerifyOtpResponse
+from app.config import settings
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+
+
+def _set_access_token_cookie(response: Response, user_id: uuid.UUID):
+    token = create_access_token(user_id)
+    response.set_cookie(
+        key="access_token",
+        value=token,
+        httponly=True,
+        samesite="none",
+        secure=True,
+        max_age=60 * 60,
+    )
 
 
 @router.post("/login", response_model=OtpRequestResponse)
@@ -27,6 +40,7 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 async def login(
     credentials: LoginRequest,
     request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
@@ -45,6 +59,10 @@ async def login(
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account is inactive")
 
+    if not settings.EMAIL_SERVICE:
+        _set_access_token_cookie(response, user.id)
+        return OtpRequestResponse(detail="Login successful", otp_required=False)
+
     expires_at = await request_otp(db, user.id, user.email, purpose="login")
     return OtpRequestResponse(expires_at=expires_at)
 
@@ -62,17 +80,10 @@ async def verify_login_otp(
     if user is None:
         raise HTTPException(status_code=400, detail="Invalid request")
 
-    await verify_otp(db, user.id, purpose="login", code=payload.code)
+    if settings.EMAIL_SERVICE:
+        await verify_otp(db, user.id, purpose="login", code=payload.code)
 
-    token = create_access_token(user.id)
-    response.set_cookie(
-        key="access_token",
-        value=token,
-        httponly=True,
-        samesite="none",
-        secure=True,
-        max_age=60 * 60,
-    )
+    _set_access_token_cookie(response, user.id)
     return VerifyOtpResponse(detail="Login successful")
 
 
@@ -88,6 +99,9 @@ async def resend_otp(
     if user is None:
         raise HTTPException(status_code=400, detail="Invalid request")
 
+    if not settings.EMAIL_SERVICE:
+        raise HTTPException(status_code=400, detail="OTP verification is currently disabled")
+
     expires_at = await request_otp(db, user.id, user.email, purpose=payload["purpose"])
     return OtpRequestResponse(expires_at=expires_at)
 
@@ -99,7 +113,12 @@ async def get_me(current_user: User = Depends(get_current_user)):
 
 @router.post("/logout")
 async def logout(response: Response):
-    response.delete_cookie("access_token")
+    response.delete_cookie(
+        "access_token",
+        httponly=True,
+        samesite="none",
+        secure=True,
+    )
     return {"detail": "Logged out"}
 
 
@@ -128,6 +147,11 @@ async def signup(payload: SignupRequest, request: Request, db: AsyncSession = De
     ))
     await db.commit()
 
+    if not settings.EMAIL_SERVICE:
+        return OtpRequestResponse(
+            detail="Signup complete. Awaiting admin approval.", otp_required=False
+        )
+
     expires_at = await request_otp(db, new_user.id, new_user.email, purpose="signup")
     return OtpRequestResponse(expires_at=expires_at)
 
@@ -144,7 +168,8 @@ async def verify_signup_otp(
     if user is None:
         raise HTTPException(status_code=400, detail="Invalid request")
 
-    await verify_otp(db, user.id, purpose="signup", code=payload.code)
+    if settings.EMAIL_SERVICE:
+        await verify_otp(db, user.id, purpose="signup", code=payload.code)
 
     return VerifyOtpResponse(detail="Email verified. Awaiting admin approval.")
 

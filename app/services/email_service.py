@@ -1,20 +1,18 @@
-import smtplib
-from email.mime.text import MIMEText
+import resend
 from fastapi.concurrency import run_in_threadpool
 
 from app.config import settings
 
+resend.api_key = settings.RESEND_API_KEY
 
-def _send_sync(to_email: str, subject: str, body: str):
-    msg = MIMEText(body)
-    msg["Subject"] = subject
-    msg["From"] = settings.SMTP_FROM_EMAIL
-    msg["To"] = to_email
 
-    with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT, timeout=10) as server:
-        server.starttls()
-        server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
-        server.send_message(msg)
+def _send_sync(to_email: str, subject: str, text_body: str):
+    resend.Emails.send({
+        "from": settings.RESEND_FROM_EMAIL,
+        "to": to_email,
+        "subject": subject,
+        "text": text_body,
+    })
 
 
 async def send_otp_email(to_email: str, code: str):

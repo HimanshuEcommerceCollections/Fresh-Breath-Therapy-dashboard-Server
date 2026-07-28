@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     SMTP_USER: str | None = None
     SMTP_PASSWORD: str | None = None
     SMTP_FROM_EMAIL: str | None = None
+    RESEND_API_KEY: str
+    RESEND_FROM_EMAIL: str
+    EMAIL_SERVICE: bool = True
 
     class Config:
         env_file = ".env"
