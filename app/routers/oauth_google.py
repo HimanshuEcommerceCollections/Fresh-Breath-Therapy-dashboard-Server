@@ -109,7 +109,9 @@ async def google_callback(
         return redirect
 
     token = create_access_token(user.id)
-    redirect = RedirectResponse(f"{settings.FRONTEND_URL}/dashboard")
+    # Canonical post-login route is "/" (the frontend's home page — there is
+    # no /dashboard route), matching the OTP/password login flow's redirect.
+    redirect = RedirectResponse(settings.FRONTEND_URL)
     redirect.set_cookie(
         key="access_token", value=token, httponly=True,
         samesite="lax", secure=False, max_age=60 * 60,
