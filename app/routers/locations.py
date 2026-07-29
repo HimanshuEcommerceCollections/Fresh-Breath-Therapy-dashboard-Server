@@ -1,10 +1,12 @@
 import uuid
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 from app.database import get_db
 from app.models.location import Location
+from app.models.therapist import Therapist
+from app.models.client import Client
 from app.schemas.location import LocationCreate, LocationResponse
 from app.models.user import User
 from app.dependencies.auth import get_current_user, require_admin
@@ -47,6 +49,22 @@ async def delete_location(
     location = await db.get(Location, location_id)
     if location is None:
         raise HTTPException(status_code=404, detail="Location not found")
+
+    therapist_count = (await db.execute(
+        select(func.count(Therapist.id)).where(Therapist.location_id == location_id)
+    )).scalar_one()
+    client_count = (await db.execute(
+        select(func.count(Client.id)).where(Client.location_id == location_id)
+    )).scalar_one()
+
+    if therapist_count or client_count:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Cannot delete this location — it still has {therapist_count} therapist(s) "
+                f"and {client_count} client(s) assigned. Reassign them first."
+            ),
+        )
 
     await db.delete(location)
     await db.commit()
