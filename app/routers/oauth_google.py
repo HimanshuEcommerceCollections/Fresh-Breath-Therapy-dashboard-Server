@@ -12,6 +12,7 @@ from app.config import settings
 from app.models.user import User
 from app.models.role_request import RoleRequest, RoleRequestStatus
 from app.services.jwt_service import create_access_token
+from app.services.auth_cookie import set_auth_cookie
 
 router = APIRouter(prefix="/api/auth/google", tags=["auth"])
 
@@ -112,9 +113,6 @@ async def google_callback(
     # Canonical post-login route is "/" (the frontend's home page — there is
     # no /dashboard route), matching the OTP/password login flow's redirect.
     redirect = RedirectResponse(settings.FRONTEND_URL)
-    redirect.set_cookie(
-        key="access_token", value=token, httponly=True,
-        samesite="lax", secure=False, max_age=60 * 60,
-    )
+    set_auth_cookie(redirect, token)
     redirect.delete_cookie("oauth_state")
     return redirect

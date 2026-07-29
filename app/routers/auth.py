@@ -19,20 +19,13 @@ from app.schemas.role_request import SignupRequest, ApproveRoleRequest, RoleRequ
 from app.services.otp_service import request_otp, verify_otp
 from app.schemas.otp import OtpRequestResponse, VerifyOtpRequest, VerifyOtpResponse
 from app.config import settings
+from app.services.auth_cookie import set_auth_cookie, clear_auth_cookie
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 
 def _set_access_token_cookie(response: Response, user_id: uuid.UUID):
-    token = create_access_token(user_id)
-    response.set_cookie(
-        key="access_token",
-        value=token,
-        httponly=True,
-        samesite="none",
-        secure=True,
-        max_age=60 * 60,
-    )
+    set_auth_cookie(response, create_access_token(user_id))
 
 
 @router.post("/login", response_model=OtpRequestResponse)
@@ -113,12 +106,7 @@ async def get_me(current_user: User = Depends(get_current_user)):
 
 @router.post("/logout")
 async def logout(response: Response):
-    response.delete_cookie(
-        "access_token",
-        httponly=True,
-        samesite="none",
-        secure=True,
-    )
+    clear_auth_cookie(response)
     return {"detail": "Logged out"}
 
 
