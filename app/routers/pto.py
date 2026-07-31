@@ -15,7 +15,10 @@ from app.schemas.pto import PtoDashboardResponse, PtoStats, LocationPtoPoint, Le
 from app.schemas.pto_transaction import PtoUsageCreate, PtoTransactionResponse
 from app.models.user import User
 from app.dependencies.auth import require_admin_or_coordinator, require_admin
-from app.services.pto_service import get_pto_balances_by_therapist, get_ytd_completed_sessions_by_therapist
+from app.services.pto_service import (
+    get_ytd_completed_sessions_by_therapist,
+    get_pto_totals_by_therapist,
+)
 
 router = APIRouter(prefix="/api/pto", tags=["pto"])
 

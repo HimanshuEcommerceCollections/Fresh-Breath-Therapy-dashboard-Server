@@ -9,12 +9,12 @@ from app.models.client import Client
 from app.models.therapist import Therapist
 from app.models.enums import SessionStatus
 from app.schemas.session import (
-    SessionCreate, SessionUpdate, SessionSearchRequest, SessionResponse, TERMINAL_STATUSES,
+    SessionCreate, SessionUpdate, SessionSearchRequest, SessionResponse,
 )
 from app.services.notification_service import create_notification
 from app.models.notification import NotificationCategory, NotificationBadge
 from app.models.user import User
-from app.dependencies.auth import get_current_user, require_admin, require_admin_or_coordinator, get_own_therapist
+from app.dependencies.auth import get_current_user, require_admin, get_own_therapist
 from app.services.session_service import check_double_booking
 from app.services.pto_service import accrue_pto_for_completed_session
 from app.dependencies.idempotency import idempotent
@@ -81,7 +81,7 @@ async def get_session(
 async def create_session(
     payload: SessionCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin_or_coordinator()),
+    current_user: User = Depends(require_admin()),
 ):
     client = await db.get(Client, payload.client_id)
     if client is None:
@@ -110,20 +110,13 @@ async def update_session(
     session_id: uuid.UUID,
     payload: SessionUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin_or_coordinator()),
+    current_user: User = Depends(require_admin()),
 ):
     session = await db.get(Session, session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
     update_data = payload.model_dump(exclude_unset=True)
-
-    if "status" in update_data and update_data["status"] in TERMINAL_STATUSES:
-        if current_user.role.name != "Admin":
-            raise HTTPException(
-                status_code=403,
-                detail="Only Admin can mark a session as Completed, Cancelled, or No Show",
-            )
 
     new_date = update_data.get("date", session.date)
     new_time = update_data.get("time", session.time)
@@ -156,7 +149,7 @@ async def update_session(
 async def delete_session(
     session_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin_or_coordinator()),
+    current_user: User = Depends(require_admin()),
 ):
     session = await db.get(Session, session_id)
     if session is None:

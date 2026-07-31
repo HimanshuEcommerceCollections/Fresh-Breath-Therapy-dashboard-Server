@@ -54,11 +54,6 @@ class PtoTransactionType(str, enum.Enum):
     USAGE = "usage"
 
 
-class IntegrationStatus(str, enum.Enum):
-    CONNECTED = "connected"
-    AVAILABLE = "available"
-
-
 class FeatureFlagCategory(str, enum.Enum):
     AUTOMATION = "automation"
     NOTIFICATION = "notification"

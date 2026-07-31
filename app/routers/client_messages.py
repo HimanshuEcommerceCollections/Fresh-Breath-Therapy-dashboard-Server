@@ -6,7 +6,7 @@ from app.database import get_db
 from app.models.client_message import ClientMessage
 from app.models.client import Client
 from app.models.user import User
-from app.dependencies.auth import require_admin_or_coordinator
+from app.dependencies.auth import require_admin
 from app.schemas.client_message import ClientMessageCreate, ClientMessageResponse
 from app.services.notification_service import create_notification
 from app.models.notification import NotificationCategory, NotificationBadge
@@ -18,7 +18,7 @@ router = APIRouter(prefix="/api/client-messages", tags=["client-messages"])
 async def create_client_message(
     payload: ClientMessageCreate,
     db=Depends(get_db),
-    current_user: User = Depends(require_admin_or_coordinator()),
+    current_user: User = Depends(require_admin()),
 ):
     client = await db.get(Client, payload.client_id)
     if client is None:

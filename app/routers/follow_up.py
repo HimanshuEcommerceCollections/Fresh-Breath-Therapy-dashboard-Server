@@ -17,7 +17,7 @@ from app.schemas.follow_up import (
 )
 from app.models.user import User
 from app.models.therapist import Therapist
-from app.dependencies.auth import get_current_user, require_admin_or_coordinator, get_own_therapist
+from app.dependencies.auth import get_current_user, require_admin, get_own_therapist
 
 router = APIRouter(prefix="/api/follow-ups", tags=["follow-ups"])
 
@@ -104,7 +104,7 @@ async def get_follow_up(
 async def create_follow_up(
     payload: FollowUpCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin_or_coordinator()),
+    current_user: User = Depends(require_admin()),
 ):
     client = await db.get(Client, payload.client_id)
     if client is None:
@@ -130,7 +130,7 @@ async def update_follow_up(
     follow_up_id: uuid.UUID,
     payload: FollowUpUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin_or_coordinator()),
+    current_user: User = Depends(require_admin()),
 ):
     follow_up = await db.get(FollowUp, follow_up_id)
     if follow_up is None:
@@ -158,7 +158,7 @@ async def update_follow_up(
 async def complete_follow_up(
     follow_up_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin_or_coordinator()),
+    current_user: User = Depends(require_admin()),
 ):
     follow_up = await db.get(FollowUp, follow_up_id)
     if follow_up is None:
@@ -182,7 +182,7 @@ async def complete_follow_up(
 async def delete_follow_up(
     follow_up_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin_or_coordinator()),
+    current_user: User = Depends(require_admin()),
 ):
     follow_up = await db.get(FollowUp, follow_up_id)
     if follow_up is None:

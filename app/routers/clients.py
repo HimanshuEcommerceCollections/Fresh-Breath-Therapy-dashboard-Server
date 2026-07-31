@@ -14,7 +14,7 @@ from app.models.session import Session as SessionModel
 from app.models.enums import ClientStatus
 from app.schemas.client import ClientCreate, ClientUpdate, ClientResponse
 from app.models.user import User
-from app.dependencies.auth import get_current_user, require_admin_or_coordinator, get_own_therapist
+from app.dependencies.auth import get_current_user, require_admin, get_own_therapist
 from app.dependencies.idempotency import idempotent
 
 router = APIRouter(prefix="/api/clients", tags=["clients"])
@@ -106,7 +106,7 @@ async def create_client(
     payload: ClientCreate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin_or_coordinator()),
+    current_user: User = Depends(require_admin()),
 ):
     location = await db.get(Location, payload.location_id)
     if location is None:
@@ -131,7 +131,7 @@ async def update_client(
     client_id: uuid.UUID,
     payload: ClientUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin_or_coordinator()),
+    current_user: User = Depends(require_admin()),
 ):
     client = await db.get(Client, client_id)
     if client is None:
@@ -164,7 +164,7 @@ async def update_client(
 async def delete_client(
     client_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin_or_coordinator()),
+    current_user: User = Depends(require_admin()),
 ):
     client = await db.get(Client, client_id)
     if client is None:
