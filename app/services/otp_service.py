@@ -1,13 +1,17 @@
+import logging
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from fastapi import HTTPException
+from fastapi.concurrency import run_in_threadpool
 
 from app.models.otp_code import OtpCode
 from app.services.security import hash_password, verify_password
-from app.services.email_queue import email_queue
+from app.services.email_service import send_otp_email
+
+logger = logging.getLogger(__name__)
 
 OTP_TTL_MINUTES = 5
 RESEND_COOLDOWN_SECONDS = 5  # TODO: revert to 5-minute cooldown (RESEND_COOLDOWN_MINUTES = 5) after testing
@@ -49,7 +53,21 @@ async def request_otp(db: AsyncSession, user_id: uuid.UUID, email: str, purpose:
         ))
 
     await db.commit()
-    await email_queue.put((email, code))
+
+    try:
+        # Sent off-loop via run_in_threadpool since smtplib is blocking, and
+        # this project's FastAPI process serves multiple concurrent requests
+        # on one event loop (see the note in email_service.py) — awaited
+        # synchronously so the request only completes once the email is
+        # actually sent, with no background retry to fall back on.
+        await run_in_threadpool(send_otp_email, email, code)
+    except Exception:
+        logger.exception(f"Failed to send OTP email to {email}")
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to send verification email. Please try again in a moment.",
+        )
+
     return expires_at
 
 

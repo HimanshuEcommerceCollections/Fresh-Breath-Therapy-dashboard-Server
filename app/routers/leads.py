@@ -13,7 +13,7 @@ from app.models.enums import LeadStatus
 from app.schemas.lead import LeadCreate, LeadUpdate, LeadResponse
 from app.schemas.client import ClientResponse
 from app.models.user import User
-from app.dependencies.auth import get_current_user, require_admin_or_coordinator, get_own_therapist
+from app.dependencies.auth import get_current_user, require_admin, get_own_therapist
 from app.dependencies.idempotency import idempotent
 from app.routers.clients import _client_query, _attach_computed_fields
 
@@ -76,7 +76,7 @@ async def create_lead(
     payload: LeadCreate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin_or_coordinator()),
+    current_user: User = Depends(require_admin()),
 ):
     location = await db.get(Location, payload.location_id)
     if location is None:
@@ -100,7 +100,7 @@ async def update_lead(
     lead_id: uuid.UUID,
     payload: LeadUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin_or_coordinator()),
+    current_user: User = Depends(require_admin()),
 ):
     lead = await db.get(Lead, lead_id)
     if lead is None:
@@ -131,7 +131,7 @@ async def update_lead(
 async def delete_lead(
     lead_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin_or_coordinator()),
+    current_user: User = Depends(require_admin()),
 ):
     lead = await db.get(Lead, lead_id)
     if lead is None:
@@ -147,7 +147,7 @@ async def convert_lead(
     lead_id: uuid.UUID,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin_or_coordinator()),
+    current_user: User = Depends(require_admin()),
 ):
     lead = await db.get(Lead, lead_id)
     if lead is None:

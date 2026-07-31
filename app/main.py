@@ -7,12 +7,11 @@ from app.database import AsyncSessionLocal
 from app.startup import ensure_auth_bootstrap
 from app.routers import (
     auth, locations, therapists, leads, clients, follow_up,
-    organization, roles, packages, feature_flags, integrations, 
-    payments, reports, oauth_google, uploads, sessions, dashboard, 
-    pto, notifications, client_messages
+    organization, roles, packages, feature_flags,
+    payments, reports, oauth_google, uploads, sessions, dashboard,
+    pto, notifications, client_messages, internal
 )
 from app.services.scheduler_service import start_scheduler
-from app.services.email_queue import start_email_worker
 
 app = FastAPI(title="FBT Dashboard API")
 
@@ -36,7 +35,6 @@ app.include_router(organization.router)
 app.include_router(roles.router)
 app.include_router(packages.router)
 app.include_router(feature_flags.router)
-app.include_router(integrations.router)
 app.include_router(payments.router)
 app.include_router(reports.router)
 app.include_router(oauth_google.router)
@@ -46,14 +44,11 @@ app.include_router(dashboard.router)
 app.include_router(pto.router)
 app.include_router(notifications.router)
 app.include_router(client_messages.router)
+app.include_router(internal.router)
 
 @app.on_event("startup")
 async def _start_scheduler():
     start_scheduler()
-
-@app.on_event("startup")
-async def _start_email_worker():
-    start_email_worker()
 
 @app.on_event("startup")
 async def on_startup():

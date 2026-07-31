@@ -1,29 +1,21 @@
-import logging
+import smtplib
+from email.mime.text import MIMEText
 
-# Resend email sending is suspended for now (EMAIL_SERVICE=false) — OTP is
-# bypassed at the router level (see app/routers/auth.py), so this should
-# never actually be called while suspended. Left commented out rather than
-# deleted so re-enabling later is a quick uncomment, not a rewrite.
-#
-# import resend
-# from fastapi.concurrency import run_in_threadpool
-# from app.config import settings
-#
-# resend.api_key = settings.RESEND_API_KEY
-#
-#
-# def _send_sync(to_email: str, subject: str, text_body: str):
-#     resend.Emails.send({
-#         "from": settings.RESEND_FROM_EMAIL,
-#         "to": to_email,
-#         "subject": subject,
-#         "text": text_body,
-#     })
-
-logger = logging.getLogger(__name__)
+from app.config import settings
 
 
-async def send_otp_email(to_email: str, code: str):
-    logger.warning(
-        f"send_otp_email called while EMAIL_SERVICE is suspended — no email sent to {to_email}"
-    )
+def send_otp_email(to_email: str, code: str):
+    """Blocking SMTP send. Callers on the async request path must run this
+    via run_in_threadpool rather than calling it bare — see otp_service.py."""
+    subject = "Your Fresh Breath Therapy verification code"
+    body = f"Your verification code is: {code}\n\nThis code expires in 5 minutes."
+
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = settings.SMTP_FROM_EMAIL
+    msg["To"] = to_email
+
+    with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT, timeout=10) as server:
+        server.starttls()
+        server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
+        server.send_message(msg)
