@@ -44,6 +44,8 @@ async def list_follow_ups(
 ):
     query = select(FollowUp).order_by(FollowUp.due_date)
     if current_user.role.name == "Therapist":
+        if own_therapist is None:
+            raise HTTPException(status_code=403, detail="No therapist record linked to this account")
         query = query.where(
             FollowUp.client_id.in_(
                 select(Client.id).where(Client.therapist_id == own_therapist.id)
