@@ -19,7 +19,8 @@ from app.schemas.role_request import SignupRequest, ApproveRoleRequest, RoleRequ
 from app.services.otp_service import request_otp, verify_otp
 from app.schemas.otp import OtpRequestResponse, VerifyOtpRequest, VerifyOtpResponse
 from app.config import settings
-from app.services.auth_cookie import set_auth_cookie, clear_auth_cookie
+from app.services.auth_cookie import ACCESS_TOKEN_COOKIE, set_auth_cookie, clear_auth_cookie
+from app.services.token_revocation_service import revoke_token
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -105,7 +106,13 @@ async def get_me(current_user: User = Depends(get_current_user)):
 
 
 @router.post("/logout")
-async def logout(response: Response):
+async def logout(request: Request, response: Response, db: AsyncSession = Depends(get_db)):
+    # Revoke the token server-side, not just clear the cookie client-side —
+    # otherwise a copy of the token captured elsewhere (another device,
+    # intercepted, etc.) would keep working until it naturally expires.
+    token = request.cookies.get(ACCESS_TOKEN_COOKIE)
+    if token:
+        await revoke_token(db, token)
     clear_auth_cookie(response)
     return {"detail": "Logged out"}
 

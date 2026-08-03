@@ -39,6 +39,8 @@ async def list_leads(
     query = _lead_query()
 
     if current_user.role.name == "Therapist":
+        if own_therapist is None:
+            raise HTTPException(status_code=403, detail="No therapist record linked to this account")
         query = query.where(Lead.therapist_id == own_therapist.id)
     if status_filter:
         query = query.where(Lead.status == status_filter)

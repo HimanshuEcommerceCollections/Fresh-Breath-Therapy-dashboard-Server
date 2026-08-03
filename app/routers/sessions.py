@@ -1,5 +1,5 @@
 import uuid
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -80,6 +80,7 @@ async def get_session(
 @idempotent(SessionResponse, status_code=status.HTTP_201_CREATED)
 async def create_session(
     payload: SessionCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_admin()),
 ):
@@ -109,6 +110,7 @@ async def create_session(
 async def update_session(
     session_id: uuid.UUID,
     payload: SessionUpdate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_admin()),
 ):
