@@ -42,11 +42,9 @@ class PaymentMethod(str, enum.Enum):
     INSURANCE = "insurance"
 
 
-class PaymentStatus(str, enum.Enum):
-    PAID = "paid"
-    PARTIALLY_PAID = "partially_paid"
-    PENDING = "pending"
-    OVERDUE = "overdue"
+class EnrollmentStatus(str, enum.Enum):
+    ACTIVE = "active"
+    COMPLETED = "completed"
 
 
 class PtoTransactionType(str, enum.Enum):

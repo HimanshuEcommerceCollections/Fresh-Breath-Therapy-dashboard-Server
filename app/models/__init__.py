@@ -5,6 +5,7 @@ from app.models.user import User
 from app.models.therapist import Therapist
 from app.models.lead import Lead
 from app.models.client import Client
+from app.models.enrollment import Enrollment
 from app.models.session import Session
 from app.models.payment import Payment
 from app.models.follow_up import FollowUp

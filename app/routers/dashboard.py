@@ -11,8 +11,9 @@ from app.models.therapist import Therapist
 from app.models.location import Location
 from app.models.session import Session as SessionModel
 from app.models.payment import Payment
+from app.models.enrollment import Enrollment
 from app.models.follow_up import FollowUp
-from app.models.enums import LeadStatus, ClientStatus, SessionStatus, PaymentStatus
+from app.models.enums import LeadStatus, ClientStatus, SessionStatus, EnrollmentStatus
 from app.schemas.dashboard import (
     DashboardResponse, LeadStat, ClientStat, SessionMetrics, RevenueMetrics,
     RevenueTrendPoint, PaymentStatusCount, FunnelStage, UpcomingSessionItem,
@@ -82,18 +83,31 @@ async def get_dashboard(
         today=sessions_today,
     )
 
-    # Revenue — org-wide sums, one query
+    # Revenue — total_revenue is the total contracted value of every
+    # enrollment ever started (active + completed); collected is actual cash
+    # taken in via the payments ledger. Neither figure lives on a single row
+    # anymore now that "due" isn't stored per-payment — see Enrollment.
     revenue_totals = (await db.execute(
-        select(func.coalesce(func.sum(Payment.due), 0), func.coalesce(func.sum(Payment.paid), 0))
-    )).one()
-    total_due, total_paid = Decimal(str(revenue_totals[0])), Decimal(str(revenue_totals[1]))
-    pending_payments = total_due - total_paid
-    total_revenue = total_due
-    collected = total_paid
+        select(func.coalesce(func.sum(Enrollment.package_price_snapshot), 0))
+    )).scalar_one()
+    total_revenue = Decimal(str(revenue_totals))
+
+    collected = (await db.execute(
+        select(func.coalesce(func.sum(Payment.amount_paid), 0))
+    )).scalar_one()
+    collected = Decimal(str(collected))
+
+    pending_payments = (await db.execute(
+        select(func.coalesce(func.sum(Enrollment.amount_due), 0))
+        .where(Enrollment.status == EnrollmentStatus.ACTIVE)
+    )).scalar_one()
+    pending_payments = Decimal(str(pending_payments))
+
     avg_per_client = (total_revenue / active_clients) if active_clients else Decimal("0")
 
     monthly_revenue = (await db.execute(
-        select(func.coalesce(func.sum(Payment.paid), 0)).where(Payment.date >= month_start)
+        select(func.coalesce(func.sum(Payment.amount_paid), 0))
+        .where(Payment.date >= month_start)
     )).scalar_one()
     monthly_revenue = Decimal(str(monthly_revenue))
 
@@ -105,27 +119,48 @@ async def get_dashboard(
         avg_per_client=avg_per_client,
     )
 
-    # Revenue trend — one grouped query
-    month_expr = func.to_char(Payment.date, "YYYY-MM").label("month")
-    trend_rows = (await db.execute(
-        select(
-            month_expr,
-            func.coalesce(func.sum(Payment.paid), 0),
-            func.coalesce(func.sum(Payment.due - Payment.paid), 0),
-        )
+    # Revenue trend — "collected" is cash actually taken in that month
+    # (sum of ledger rows dated in it). "pending" is the amount still owed,
+    # as of today, from enrollments that were STARTED in that month — a
+    # ledger has no per-historical-month "amount still due" figure the way
+    # a due/paid snapshot row used to, so this is the closest still-useful
+    # analogue: "how much of the business opened that month is unpaid now".
+    collected_month_expr = func.to_char(Payment.date, "YYYY-MM").label("month")
+    collected_rows = (await db.execute(
+        select(collected_month_expr, func.coalesce(func.sum(Payment.amount_paid), 0))
         .where(Payment.date >= six_months_ago)
-        .group_by(month_expr)
-        .order_by(month_expr)
+        .group_by(collected_month_expr)
     )).all()
+    collected_by_month = {row[0]: Decimal(str(row[1])) for row in collected_rows}
+
+    pending_month_expr = func.to_char(Enrollment.started_at, "YYYY-MM").label("month")
+    pending_rows = (await db.execute(
+        select(pending_month_expr, func.coalesce(func.sum(Enrollment.amount_due), 0))
+        .where(Enrollment.started_at >= six_months_ago, Enrollment.status == EnrollmentStatus.ACTIVE)
+        .group_by(pending_month_expr)
+    )).all()
+    pending_by_month = {row[0]: Decimal(str(row[1])) for row in pending_rows}
+
+    all_months = sorted(set(collected_by_month) | set(pending_by_month))
     revenue_trend = [
-        RevenueTrendPoint(month=row[0], collected=row[1], pending=row[2]) for row in trend_rows
+        RevenueTrendPoint(
+            month=month,
+            collected=collected_by_month.get(month, Decimal("0")),
+            pending=pending_by_month.get(month, Decimal("0")),
+        )
+        for month in all_months
     ]
 
-    # Payment status distribution — one grouped query
-    payment_status_rows = (await db.execute(
-        select(Payment.status, func.count(Payment.id)).group_by(Payment.status)
+    # Enrollment status distribution (active vs completed) — the ledger
+    # redesign means an individual payment no longer carries its own
+    # paid/partially-paid/overdue status; that state now lives on the
+    # enrollment it belongs to.
+    enrollment_status_rows = (await db.execute(
+        select(Enrollment.status, func.count(Enrollment.id)).group_by(Enrollment.status)
     )).all()
-    payment_status = [PaymentStatusCount(status=row[0].value, count=row[1]) for row in payment_status_rows]
+    payment_status = [
+        PaymentStatusCount(status=row[0].value, count=row[1]) for row in enrollment_status_rows
+    ]
 
     # Lead funnel — one grouped query, filled to all 8 statuses
     funnel_rows = (await db.execute(

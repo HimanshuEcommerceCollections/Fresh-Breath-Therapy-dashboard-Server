@@ -1,5 +1,5 @@
 import uuid
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, status, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_
 from sqlalchemy.orm import selectinload
@@ -15,6 +15,7 @@ from app.schemas.client import ClientResponse
 from app.models.user import User
 from app.dependencies.auth import get_current_user, require_admin, get_own_therapist
 from app.dependencies.idempotency import idempotent
+from app.services.pagination import Page, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, apply_keyset_pagination, paginate_rows
 from app.routers.clients import _client_query, _attach_computed_fields
 
 router = APIRouter(prefix="/api/leads", tags=["leads"])
@@ -27,11 +28,13 @@ def _lead_query():
     )
 
 
-@router.get("", response_model=list[LeadResponse])
+@router.get("", response_model=Page[LeadResponse])
 async def list_leads(
     status_filter: LeadStatus | None = None,
     location_id: uuid.UUID | None = None,
     search: str | None = None,
+    cursor: str | None = None,
+    limit: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
     own_therapist: Therapist | None = Depends(get_own_therapist),
@@ -52,8 +55,10 @@ async def list_leads(
             or_(Lead.name.ilike(term), Lead.email.ilike(term), Lead.phone.ilike(term))
         )
 
-    result = await db.execute(query.order_by(Lead.created_at.desc()))
-    return result.scalars().all()
+    query = apply_keyset_pagination(query, Lead, cursor, limit)
+    result = await db.execute(query)
+    items, next_cursor, has_more = paginate_rows(result.scalars().all(), limit)
+    return Page(items=items, next_cursor=next_cursor, has_more=has_more)
 
 
 @router.get("/{lead_id}", response_model=LeadResponse)

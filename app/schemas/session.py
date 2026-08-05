@@ -29,6 +29,8 @@ class SessionSearchRequest(BaseModel):
     status: SessionStatus | None = None
     date_from: date_type | None = None
     date_to: date_type | None = None
+    cursor: str | None = None
+    limit: int = 25
 
 
 class ClientBrief(ORMBase):

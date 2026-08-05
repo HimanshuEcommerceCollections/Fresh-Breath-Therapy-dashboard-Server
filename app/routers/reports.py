@@ -45,7 +45,7 @@ async def sales_report(
     start_date = _range_to_start_date(range)
     query = (
         select(func.to_char(Payment.date, "YYYY-MM").label("month"),
-               func.coalesce(func.sum(Payment.paid), 0))
+               func.coalesce(func.sum(Payment.amount_paid), 0))
         .join(Client, Payment.client_id == Client.id)
     )
     if location_id:
@@ -177,11 +177,11 @@ async def revenue_by_therapist_report(
 ):
     start_date = _range_to_start_date(range)
     query = (
-        select(Therapist.id, Therapist.name, func.coalesce(func.sum(Payment.paid), 0))
+        select(Therapist.id, Therapist.name, func.coalesce(func.sum(Payment.amount_paid), 0))
         .join(Client, Client.therapist_id == Therapist.id)
         .join(Payment, Payment.client_id == Client.id)
         .group_by(Therapist.id, Therapist.name)
-        .order_by(func.sum(Payment.paid).desc())
+        .order_by(func.sum(Payment.amount_paid).desc())
     )
     if location_id:
         query = query.where(Therapist.location_id == location_id)

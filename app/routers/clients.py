@@ -1,6 +1,6 @@
 import uuid
 from decimal import Decimal
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, status, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, func
 from sqlalchemy.orm import selectinload
@@ -16,6 +16,7 @@ from app.schemas.client import ClientCreate, ClientUpdate, ClientResponse
 from app.models.user import User
 from app.dependencies.auth import get_current_user, require_admin, get_own_therapist
 from app.dependencies.idempotency import idempotent
+from app.services.pagination import Page, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, apply_keyset_pagination, paginate_rows
 
 router = APIRouter(prefix="/api/clients", tags=["clients"])
 
@@ -34,7 +35,7 @@ async def _attach_computed_fields(db: AsyncSession, clients: list[Client]) -> li
     client_ids = [c.id for c in clients]
 
     payment_rows = await db.execute(
-        select(Payment.client_id, func.coalesce(func.sum(Payment.paid), 0))
+        select(Payment.client_id, func.coalesce(func.sum(Payment.amount_paid), 0))
         .where(Payment.client_id.in_(client_ids))
         .group_by(Payment.client_id)
     )
@@ -56,11 +57,13 @@ async def _attach_computed_fields(db: AsyncSession, clients: list[Client]) -> li
     return responses
 
 
-@router.get("", response_model=list[ClientResponse])
+@router.get("", response_model=Page[ClientResponse])
 async def list_clients(
     status_filter: ClientStatus | None = None,
     location_id: uuid.UUID | None = None,
     search: str | None = None,
+    cursor: str | None = None,
+    limit: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
     own_therapist: Therapist | None = Depends(get_own_therapist),
@@ -79,9 +82,11 @@ async def list_clients(
         term = f"%{search}%"
         query = query.where(or_(Client.name.ilike(term), Client.email.ilike(term)))
 
-    result = await db.execute(query.order_by(Client.created_at.desc()))
-    clients = result.scalars().all()
-    return await _attach_computed_fields(db, clients)
+    query = apply_keyset_pagination(query, Client, cursor, limit)
+    result = await db.execute(query)
+    clients, next_cursor, has_more = paginate_rows(result.scalars().all(), limit)
+    responses = await _attach_computed_fields(db, clients)
+    return Page(items=responses, next_cursor=next_cursor, has_more=has_more)
 
 
 @router.get("/{client_id}", response_model=ClientResponse)
