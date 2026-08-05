@@ -18,7 +18,7 @@ from app.schemas.report import (
     RevenuePoint, RetentionPoint,
 )
 from app.models.user import User
-from app.dependencies.auth import get_current_user
+from app.dependencies.auth import require_admin_or_coordinator
 
 router = APIRouter(prefix="/api/reports", tags=["reports"])
 
@@ -40,7 +40,7 @@ async def sales_report(
     range: str = "last_6_months",
     location_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     start_date = _range_to_start_date(range)
     query = (
@@ -74,7 +74,7 @@ async def clients_by_status_report(
     range: str = "last_6_months",
     location_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     start_date = _range_to_start_date(range)
     counts = await _lead_status_counts(db, location_id, start_date)
@@ -86,7 +86,7 @@ async def team_performance_report(
     range: str = "last_6_months",
     location_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     start_date = _range_to_start_date(range)
     query = (
@@ -114,7 +114,7 @@ async def conversion_report(
     range: str = "last_6_months",
     location_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     start_date = _range_to_start_date(range)
     counts = await _lead_status_counts(db, location_id, start_date)
@@ -145,7 +145,7 @@ async def conversion_report(
 async def utilization_report(
     location_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     query = select(Therapist.id, Therapist.name, Therapist.created_at)
     if location_id:
@@ -173,7 +173,7 @@ async def revenue_by_therapist_report(
     range: str = "last_6_months",
     location_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     start_date = _range_to_start_date(range)
     query = (
@@ -198,7 +198,7 @@ async def revenue_by_therapist_report(
 @router.get("/retention", response_model=list[RetentionPoint])
 async def retention_by_location_report(
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     locations = (await db.execute(select(Location.id, Location.name))).all()
 
