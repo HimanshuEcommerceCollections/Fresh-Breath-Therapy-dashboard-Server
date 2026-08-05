@@ -25,6 +25,17 @@ class Settings(BaseSettings):
     # somewhere the in-process scheduler can't. No default: unset means the
     # route refuses every request rather than running unauthenticated.
     CRON_SECRET: str | None = None
+    # Supabase's session-mode pooler caps this project at 15 concurrent
+    # clients. SQLAlchemy's DEFAULT pool (5 + 10 overflow) can therefore
+    # consume the entire quota from one process, leaving nothing for Alembic,
+    # a maintenance script, or a second worker — and once the cap is hit every
+    # request blocks forever waiting for a connection that can't arrive.
+    # These leave deliberate headroom; raise only if the Supabase plan does.
+    DB_POOL_SIZE: int = 5
+    DB_MAX_OVERFLOW: int = 3
+    DB_POOL_TIMEOUT: int = 15  # fail loudly instead of hanging indefinitely
+    DB_POOL_RECYCLE: int = 1800
+    DB_ECHO: bool = False  # SQL logging is very noisy; opt in per environment
 
     class Config:
         env_file = ".env"

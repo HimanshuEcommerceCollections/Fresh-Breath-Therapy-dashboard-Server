@@ -62,7 +62,13 @@ def idempotent(response_model=None, status_code: int = 200):
             response_value = await handler(*args, **kwargs)
 
             if response_model is not None:
-                body = jsonable_encoder(response_model.model_validate(response_value))
+                # from_attributes: handlers return SQLAlchemy instances, and
+                # FastAPI's own response_model pass sets this. Without it,
+                # nested response models fail to validate off an ORM object
+                # and the route 500s only when an Idempotency-Key is sent.
+                body = jsonable_encoder(
+                    response_model.model_validate(response_value, from_attributes=True)
+                )
             else:
                 body = jsonable_encoder(response_value)
 

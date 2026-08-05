@@ -2,7 +2,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, case, literal
 
 from app.database import get_db
 from app.models.lead import Lead
@@ -13,7 +13,7 @@ from app.models.session import Session as SessionModel
 from app.models.payment import Payment
 from app.models.enrollment import Enrollment
 from app.models.follow_up import FollowUp
-from app.models.enums import LeadStatus, ClientStatus, SessionStatus, EnrollmentStatus
+from app.models.enums import LeadStatus, ClientStatus, SessionStatus, EnrollmentStatus, PaymentStatus
 from app.schemas.dashboard import (
     DashboardResponse, LeadStat, ClientStat, SessionMetrics, RevenueMetrics,
     RevenueTrendPoint, PaymentStatusCount, FunnelStage, UpcomingSessionItem,
@@ -156,15 +156,25 @@ async def get_dashboard(
         for month in all_months
     ]
 
-    # Enrollment status distribution (active vs completed) — the ledger
-    # redesign means an individual payment no longer carries its own
-    # paid/partially-paid/overdue status; that state now lives on the
-    # enrollment it belongs to.
-    enrollment_status_rows = (await db.execute(
-        select(Enrollment.status, func.count(Enrollment.id)).group_by(Enrollment.status)
+    # Invoice payment-status distribution — the same four states the Payments
+    # page shows (paid / partially paid / pending / overdue), derived in SQL so
+    # this donut can't disagree with that table. Mirrors
+    # Enrollment.payment_status; keep the two in step if either changes.
+    status_expr = case(
+        (Enrollment.is_overdue.is_(True), literal(PaymentStatus.OVERDUE.value)),
+        (Enrollment.total_paid <= 0, literal(PaymentStatus.PENDING.value)),
+        (Enrollment.total_paid >= Enrollment.package_price_snapshot,
+         literal(PaymentStatus.PAID.value)),
+        else_=literal(PaymentStatus.PARTIALLY_PAID.value),
+    )
+    status_rows = (await db.execute(
+        select(status_expr.label("s"), func.count(Enrollment.id)).group_by(status_expr)
     )).all()
+    counts_by_status = {row[0]: row[1] for row in status_rows}
     payment_status = [
-        PaymentStatusCount(status=row[0].value, count=row[1]) for row in enrollment_status_rows
+        PaymentStatusCount(status=s.value, count=counts_by_status.get(s.value, 0))
+        for s in PaymentStatus
+        if counts_by_status.get(s.value, 0) > 0
     ]
 
     # Lead funnel — one grouped query, filled to all 8 statuses

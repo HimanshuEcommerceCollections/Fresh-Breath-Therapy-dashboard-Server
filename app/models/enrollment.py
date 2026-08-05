@@ -1,11 +1,12 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Numeric, DateTime, ForeignKey, Enum, Index, func
+from decimal import Decimal
+from sqlalchemy import Boolean, Numeric, DateTime, ForeignKey, Enum, Index, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID
 
 from app.database import Base
-from app.models.enums import EnrollmentStatus
+from app.models.enums import EnrollmentStatus, PaymentStatus
 
 
 class Enrollment(Base):
@@ -47,6 +48,10 @@ class Enrollment(Base):
         nullable=False,
         default=EnrollmentStatus.ACTIVE,
     )
+    # Admin-only override. The other three payment statuses are derived from
+    # the money (see payment_status); "overdue" is a human judgement call, so
+    # it's the only one that needs storing. Clearing it re-derives.
+    is_overdue: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -60,3 +65,18 @@ class Enrollment(Base):
 
     client: Mapped["Client"] = relationship()
     package: Mapped["Package"] = relationship()
+
+    @property
+    def payment_status(self) -> PaymentStatus:
+        """The status the Payments table renders. Admin's overdue flag wins;
+        otherwise it falls out of what's actually been paid, so the badge can
+        never claim 'Paid' on an invoice that still has a balance."""
+        if self.is_overdue:
+            return PaymentStatus.OVERDUE
+        paid = Decimal(str(self.total_paid or 0))
+        price = Decimal(str(self.package_price_snapshot or 0))
+        if paid <= 0:
+            return PaymentStatus.PENDING
+        if paid >= price:
+            return PaymentStatus.PAID
+        return PaymentStatus.PARTIALLY_PAID

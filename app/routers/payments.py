@@ -122,6 +122,9 @@ async def create_payment(
     if Decimal(str(enrollment.total_paid)) >= Decimal(str(enrollment.package_price_snapshot)):
         enrollment.status = EnrollmentStatus.COMPLETED
         enrollment.completed_at = datetime.now(timezone.utc)
+        # Settled in full, so an admin's earlier "Overdue" mark no longer
+        # applies — leaving it set would show a fully-paid invoice as overdue.
+        enrollment.is_overdue = False
 
     payment = Payment(
         id=uuid.uuid4(),
