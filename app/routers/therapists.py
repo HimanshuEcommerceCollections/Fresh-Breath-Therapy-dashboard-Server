@@ -35,7 +35,7 @@ async def _attach_computed_fields(db: AsyncSession, therapists: list[Therapist])
     active_clients_by_therapist = {row[0]: row[1] for row in active_client_rows}
 
     revenue_rows = (await db.execute(
-        select(Client.therapist_id, func.coalesce(func.sum(Payment.paid), 0))
+        select(Client.therapist_id, func.coalesce(func.sum(Payment.amount_paid), 0))
         .join(Payment, Payment.client_id == Client.id)
         .where(Client.therapist_id.in_(therapist_ids))
         .group_by(Client.therapist_id)

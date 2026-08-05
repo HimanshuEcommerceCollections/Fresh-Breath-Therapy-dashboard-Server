@@ -4,8 +4,7 @@ from sqlalchemy import select
 from app.database import AsyncSessionLocal
 from app.models.follow_up import FollowUp
 from app.models.session import Session as SessionModel
-from app.models.payment import Payment
-from app.models.enums import SessionStatus, PaymentStatus
+from app.models.enums import SessionStatus
 from app.services.notification_service import create_notification
 from app.models.notification import NotificationCategory, NotificationBadge
 from app.models.client import Client

@@ -8,7 +8,7 @@ from app.startup import ensure_auth_bootstrap
 from app.routers import (
     auth, locations, therapists, leads, clients, follow_up,
     organization, roles, packages, feature_flags,
-    payments, reports, oauth_google, uploads, sessions, dashboard,
+    payments, enrollments, reports, oauth_google, uploads, sessions, dashboard,
     pto, notifications, client_messages, internal
 )
 from app.services.scheduler_service import start_scheduler
@@ -36,6 +36,7 @@ app.include_router(roles.router)
 app.include_router(packages.router)
 app.include_router(feature_flags.router)
 app.include_router(payments.router)
+app.include_router(enrollments.router)
 app.include_router(reports.router)
 app.include_router(oauth_google.router)
 app.include_router(uploads.router)

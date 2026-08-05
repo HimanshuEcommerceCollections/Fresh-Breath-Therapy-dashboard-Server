@@ -1,8 +1,8 @@
 import uuid
 from datetime import date, datetime, timezone
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, case, literal
 from app.services.notification_service import create_notification
 from app.models.notification import NotificationCategory, NotificationBadge
 from app.database import get_db
@@ -18,6 +18,7 @@ from app.schemas.follow_up import (
 from app.models.user import User
 from app.models.therapist import Therapist
 from app.dependencies.auth import get_current_user, require_admin, get_own_therapist
+from app.services.pagination import Page, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, apply_keyset_pagination, paginate_rows
 
 router = APIRouter(prefix="/api/follow-ups", tags=["follow-ups"])
 
@@ -35,14 +36,28 @@ def _to_response(follow_up: FollowUp) -> FollowUpResponse:
     return response
 
 
-@router.get("", response_model=list[FollowUpResponse])
+def _status_expression():
+    """Mirrors _compute_status in SQL so status_filter can be applied before
+    the keyset LIMIT — filtering the Python-side list after fetching a page
+    would silently under-fill or empty pages once a filter is combined with
+    pagination."""
+    return case(
+        (FollowUp.completed_at.is_not(None), literal(FollowUpStatus.COMPLETED.value)),
+        (FollowUp.due_date < date.today(), literal(FollowUpStatus.OVERDUE.value)),
+        else_=literal(FollowUpStatus.PENDING.value),
+    )
+
+
+@router.get("", response_model=Page[FollowUpResponse])
 async def list_follow_ups(
     status_filter: FollowUpStatus | None = None,
+    cursor: str | None = None,
+    limit: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
     own_therapist: Therapist | None = Depends(get_own_therapist),
 ):
-    query = select(FollowUp).order_by(FollowUp.due_date)
+    query = select(FollowUp)
     if current_user.role.name == "Therapist":
         if own_therapist is None:
             raise HTTPException(status_code=403, detail="No therapist record linked to this account")
@@ -51,14 +66,14 @@ async def list_follow_ups(
                 select(Client.id).where(Client.therapist_id == own_therapist.id)
             )
         )
-    result = await db.execute(query)
-    follow_ups = result.scalars().all()
-    responses = [_to_response(f) for f in follow_ups]
-
     if status_filter:
-        responses = [r for r in responses if r.status == status_filter]
+        query = query.where(_status_expression() == status_filter.value)
 
-    return responses
+    query = apply_keyset_pagination(query, FollowUp, cursor, limit)
+    result = await db.execute(query)
+    follow_ups, next_cursor, has_more = paginate_rows(result.scalars().all(), limit)
+    responses = [_to_response(f) for f in follow_ups]
+    return Page(items=responses, next_cursor=next_cursor, has_more=has_more)
 
 
 @router.get("/stats", response_model=FollowUpStats)

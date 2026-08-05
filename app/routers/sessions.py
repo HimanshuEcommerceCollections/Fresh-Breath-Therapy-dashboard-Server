@@ -18,6 +18,7 @@ from app.dependencies.auth import get_current_user, require_admin, get_own_thera
 from app.services.session_service import check_double_booking
 from app.services.pto_service import accrue_pto_for_completed_session
 from app.dependencies.idempotency import idempotent
+from app.services.pagination import Page, MAX_PAGE_SIZE, apply_keyset_pagination, paginate_rows
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
@@ -28,7 +29,7 @@ def _session_query():
     )
 
 
-@router.post("/search", response_model=list[SessionResponse])
+@router.post("/search", response_model=Page[SessionResponse])
 async def search_sessions(
     payload: SessionSearchRequest,
     db: AsyncSession = Depends(get_db),
@@ -53,8 +54,11 @@ async def search_sessions(
     if payload.date_to:
         query = query.where(Session.date <= payload.date_to)
 
-    result = await db.execute(query.order_by(Session.date, Session.time))
-    return result.scalars().all()
+    limit = min(max(payload.limit, 1), MAX_PAGE_SIZE)
+    query = apply_keyset_pagination(query, Session, payload.cursor, limit)
+    result = await db.execute(query)
+    items, next_cursor, has_more = paginate_rows(result.scalars().all(), limit)
+    return Page(items=items, next_cursor=next_cursor, has_more=has_more)
 
 
 @router.get("/{session_id}", response_model=SessionResponse)

@@ -4,33 +4,39 @@ from decimal import Decimal
 from pydantic import BaseModel
 from app.schemas.base import ORMBase
 from app.schemas.package import PackageResponse
-from app.models.enums import PaymentMethod, PaymentStatus
+from app.schemas.enrollment import EnrollmentResponse
+from app.models.enums import PaymentMethod
 
 
 class PaymentCreate(BaseModel):
     client_id: uuid.UUID
     package_id: uuid.UUID
-    due: Decimal
-    paid: Decimal = Decimal("0")
+    amount_paid: Decimal
     method: PaymentMethod
     date: date
-    status: PaymentStatus = PaymentStatus.PENDING
 
 
 class PaymentUpdate(BaseModel):
-    paid: Decimal | None = None
+    # The ledger row itself is immutable (amount_paid/date/enrollment can't
+    # be edited without corrupting the running total_paid/balance_after
+    # history) — only a data-entry typo on the method is correctable here.
     method: PaymentMethod | None = None
-    status: PaymentStatus | None = None
 
 
 class PaymentResponse(ORMBase):
     id: uuid.UUID
-    due: Decimal
-    paid: Decimal
+    enrollment_id: uuid.UUID
+    client_id: uuid.UUID
+    amount_paid: Decimal
+    balance_after: Decimal
     method: PaymentMethod
     date: date
-    status: PaymentStatus
     created_at: datetime
-    client_id: uuid.UUID
     package: PackageResponse
-    balance: Decimal = Decimal("0")
+    enrollment: EnrollmentResponse
+
+
+class PaymentCreateResult(BaseModel):
+    payment: PaymentResponse
+    enrollment: EnrollmentResponse
+    is_new_cycle: bool
