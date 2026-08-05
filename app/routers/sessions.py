@@ -103,6 +103,17 @@ async def create_session(
     if session.status == SessionStatus.COMPLETED:
         await accrue_pto_for_completed_session(db, session.id, session.therapist_id)
 
+    # A session can be entered already marked no-show (backfilling yesterday's
+    # calendar), not only transitioned into it — notify either way, so this
+    # matches the COMPLETED->PTO accrual above and the update path below.
+    if session.status == SessionStatus.NO_SHOW:
+        await create_notification(
+            db, NotificationCategory.MISSED_SESSION, NotificationBadge.OVERDUE,
+            title="Missed session", body="A session was marked as no-show.",
+            therapist_id=session.therapist_id,
+            related_entity_type="session", related_entity_id=session.id, commit=False,
+        )
+
     await db.commit()
 
     result = await db.execute(_session_query().where(Session.id == session.id))

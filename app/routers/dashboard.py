@@ -103,7 +103,12 @@ async def get_dashboard(
     )).scalar_one()
     pending_payments = Decimal(str(pending_payments))
 
-    avg_per_client = (total_revenue / active_clients) if active_clients else Decimal("0")
+    # Quantize to cents — an unrounded Decimal division serialises as a
+    # 24-decimal-place string in the JSON response.
+    avg_per_client = (
+        (total_revenue / active_clients).quantize(Decimal("0.01"))
+        if active_clients else Decimal("0.00")
+    )
 
     monthly_revenue = (await db.execute(
         select(func.coalesce(func.sum(Payment.amount_paid), 0))

@@ -15,7 +15,7 @@ from app.models.enums import EnrollmentStatus
 from app.schemas.payment import PaymentCreate, PaymentUpdate, PaymentResponse, PaymentCreateResult
 from app.schemas.enrollment import EnrollmentResponse
 from app.models.user import User
-from app.dependencies.auth import get_current_user, require_admin
+from app.dependencies.auth import require_admin, require_admin_or_coordinator
 from app.dependencies.idempotency import idempotent
 from app.services.pagination import Page, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, apply_keyset_pagination, paginate_rows
 
@@ -35,7 +35,7 @@ async def list_payments(
     cursor: str | None = None,
     limit: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     query = _payment_query()
     if client_id:
@@ -52,7 +52,7 @@ async def list_payments(
 async def get_payment(
     payment_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     result = await db.execute(_payment_query().where(Payment.id == payment_id))
     payment = result.scalar_one_or_none()

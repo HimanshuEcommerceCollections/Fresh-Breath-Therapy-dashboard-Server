@@ -11,7 +11,7 @@ from app.models.enums import EnrollmentStatus
 from app.schemas.enrollment import EnrollmentResponse, EnrollmentWithDetailsResponse
 from app.schemas.payment import PaymentResponse
 from app.models.user import User
-from app.dependencies.auth import get_current_user
+from app.dependencies.auth import require_admin_or_coordinator
 
 router = APIRouter(prefix="/api/enrollments", tags=["enrollments"])
 
@@ -20,7 +20,7 @@ router = APIRouter(prefix="/api/enrollments", tags=["enrollments"])
 async def list_enrollments(
     status_filter: EnrollmentStatus | None = None,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     """Every enrollment with its client/package — the source for the
     Payments page's revenue stats and status-distribution chart, computed
@@ -40,7 +40,7 @@ async def enrollment_history(
     client_id: uuid.UUID = Query(...),
     package_id: uuid.UUID = Query(...),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     """Every enrollment (any status) for this client+package, newest first.
     The Record Payment modal uses this — separately from /lookup, which only
@@ -60,7 +60,7 @@ async def lookup_active_enrollment(
     client_id: uuid.UUID = Query(...),
     package_id: uuid.UUID = Query(...),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     """The Record Payment modal calls this the moment both Client and
     Package are picked, to auto-populate 'paid so far' / 'amount due'
@@ -86,7 +86,7 @@ async def list_enrollment_payments(
     limit: int = Query(default=25, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin_or_coordinator()),
 ):
     enrollment = await db.get(Enrollment, enrollment_id)
     if enrollment is None:
