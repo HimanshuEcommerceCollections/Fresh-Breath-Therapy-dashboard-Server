@@ -18,6 +18,14 @@ class Therapist(Base):
     )
     name: Mapped[str] = mapped_column(String, nullable=False)
     credential: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Free text, e.g. "Anxiety, CBT" — the Add/Edit Therapist form has always
+    # collected this; it previously had nowhere to go and was dropped on submit.
+    specialization: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Full-time / Part-time / Contractor. Distinct from is_active: that's
+    # whether they currently work here at all, this is on what terms. Kept a
+    # plain string rather than a PG enum so adding "Intern" later needs no
+    # migration; the form constrains the choices.
+    employment_status: Mapped[str | None] = mapped_column(String, nullable=True)
     location_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("locations.id"), nullable=False
     )
