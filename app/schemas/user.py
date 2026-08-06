@@ -2,17 +2,18 @@ import uuid
 from pydantic import BaseModel, EmailStr
 from app.schemas.base import ORMBase
 from app.schemas.role import RoleResponse
+from app.schemas.fields import PersonName, Email
 
 
 class UserCreate(BaseModel):
-    name: str
-    email: EmailStr
+    name: PersonName
+    email: Email
     password: str
     role_id: uuid.UUID
 
 
 class UserUpdate(BaseModel):
-    name: str | None = None
+    name: PersonName | None = None
     avatar_url: str | None = None
     is_active: bool | None = None
 

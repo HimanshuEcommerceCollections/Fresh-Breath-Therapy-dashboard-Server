@@ -6,19 +6,20 @@ from app.schemas.base import ORMBase
 from app.schemas.location import LocationResponse
 from app.schemas.therapist import TherapistResponse
 from app.models.enums import ClientStatus
+from app.schemas.fields import PersonName, Email
 
 
 class ClientCreate(BaseModel):
-    name: str
-    email: EmailStr
+    name: PersonName
+    email: Email
     therapist_id: uuid.UUID
     location_id: uuid.UUID
     status: ClientStatus = ClientStatus.CONSULTATION_COMPLETED
 
 
 class ClientUpdate(BaseModel):
-    name: str | None = None
-    email: EmailStr | None = None
+    name: PersonName | None = None
+    email: Email | None = None
     therapist_id: uuid.UUID | None = None
     location_id: uuid.UUID | None = None
     status: ClientStatus | None = None

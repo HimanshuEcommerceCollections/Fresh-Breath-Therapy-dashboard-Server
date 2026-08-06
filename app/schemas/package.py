@@ -2,10 +2,11 @@ import uuid
 from decimal import Decimal
 from pydantic import BaseModel
 from app.schemas.base import ORMBase
+from app.schemas.fields import ShortName
 
 
 class PackageBase(BaseModel):
-    name: str
+    name: ShortName
     price: Decimal
     is_active: bool = True
 
@@ -15,7 +16,7 @@ class PackageCreate(PackageBase):
 
 
 class PackageUpdate(BaseModel):
-    name: str | None = None
+    name: ShortName | None = None
     price: Decimal | None = None
     is_active: bool | None = None
 

@@ -40,6 +40,15 @@ class Settings(BaseSettings):
     # pooler that silently drops idle connections; turn off if the DB is
     # co-located and latency matters more than reconnect resilience.
     DB_POOL_PRE_PING: bool = True
+    # Shared secret the website's lead automation must present in the
+    # X-Webhook-Secret header. No default: unset means the webhook rejects
+    # every request rather than accepting unauthenticated leads from anyone
+    # who guesses the URL.
+    LEAD_WEBHOOK_SECRET: str | None = None
+    # Optional fallback for inbound leads whose Location text matches no
+    # location on record. Without it, such a lead is rejected (422) and the
+    # automation surfaces the error instead of the lead landing unassigned.
+    LEAD_WEBHOOK_DEFAULT_LOCATION_ID: str | None = None
 
     class Config:
         env_file = ".env"

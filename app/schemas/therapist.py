@@ -3,25 +3,26 @@ from decimal import Decimal
 from pydantic import BaseModel, EmailStr, Field
 from app.schemas.base import ORMBase
 from app.schemas.location import LocationResponse
+from app.schemas.fields import PersonName, Email
 
 
 class TherapistCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=200)
+    name: PersonName
     credential: str | None = Field(default=None, max_length=100)
     specialization: str | None = Field(default=None, max_length=200)
     employment_status: str | None = Field(default=None, max_length=50)
     location_id: uuid.UUID
-    email: EmailStr
+    email: Email
     avatar_url: str | None = None
 
 
 class TherapistUpdate(BaseModel):
-    name: str | None = Field(default=None, min_length=1, max_length=200)
+    name: PersonName | None = None
     credential: str | None = Field(default=None, max_length=100)
     specialization: str | None = Field(default=None, max_length=200)
     employment_status: str | None = Field(default=None, max_length=50)
     location_id: uuid.UUID | None = None
-    email: EmailStr | None = None
+    email: Email | None = None
     avatar_url: str | None = None
     is_active: bool | None = None
 

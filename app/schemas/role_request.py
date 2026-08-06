@@ -3,11 +3,12 @@ from datetime import datetime
 from pydantic import BaseModel, EmailStr
 from app.schemas.base import ORMBase
 from app.models.role_request import RoleRequestStatus
+from app.schemas.fields import PersonName, Email
 
 
 class SignupRequest(BaseModel):
-    name: str
-    email: EmailStr
+    name: PersonName
+    email: Email
     password: str
 
 
