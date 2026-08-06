@@ -74,3 +74,8 @@ class LeadWebhookResult(BaseModel):
     status: str
     lead_id: uuid.UUID
     duplicate: bool = False
+    # True when the submitted location matched no existing clinic and a new
+    # one was created automatically — worth surfacing so a location-name typo
+    # in the form's mapping is visible in the automation's own logs, not just
+    # in the dashboard's location list.
+    location_created: bool = False

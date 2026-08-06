@@ -45,10 +45,6 @@ class Settings(BaseSettings):
     # every request rather than accepting unauthenticated leads from anyone
     # who guesses the URL.
     LEAD_WEBHOOK_SECRET: str | None = None
-    # Optional fallback for inbound leads whose Location text matches no
-    # location on record. Without it, such a lead is rejected (422) and the
-    # automation surfaces the error instead of the lead landing unassigned.
-    LEAD_WEBHOOK_DEFAULT_LOCATION_ID: str | None = None
 
     class Config:
         env_file = ".env"

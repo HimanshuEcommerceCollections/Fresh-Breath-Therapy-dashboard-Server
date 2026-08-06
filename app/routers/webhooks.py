@@ -23,6 +23,7 @@ from app.database import get_db
 from app.models.lead import Lead
 from app.models.location import Location
 from app.models.enums import LeadStatus
+from app.schemas.fields import MAX_NAME_LENGTH
 from app.schemas.webhook import LeadWebhookPayload, LeadWebhookResult
 from app.services.notification_service import create_notification
 from app.models.notification import NotificationCategory, NotificationBadge
@@ -52,45 +53,58 @@ def verify_webhook_secret(
         )
 
 
-async def _resolve_location(db: AsyncSession, submitted: str | None) -> uuid.UUID:
+async def _resolve_location(db: AsyncSession, submitted: str | None) -> tuple[uuid.UUID, bool]:
     """The automation sends a location NAME; leads.location_id is non-nullable.
-    Matched case-insensitively, then falls back to a configured default so a
-    naming mismatch downgrades to "filed under the default clinic" rather than
-    a dropped lead."""
-    if submitted:
+
+    Matched case-insensitively against existing clinics first. If nothing
+    matches — a genuinely new city, or just a spelling difference — a new
+    Location is created on the fly rather than rejecting the lead or filing
+    it under an unrelated default. The admin sees it appear in the location
+    list (and every location dropdown already has a delete action), so a
+    typo-driven duplicate costs one click to clean up; a rejected or
+    misfiled lead costs a lost client.
+
+    Returns (location_id, was_created).
+    """
+    if not submitted or not submitted.strip():
+        submitted = "Unspecified"
+    name = submitted.strip()
+
+    result = await db.execute(
+        select(Location).where(func.lower(Location.name) == func.lower(name))
+    )
+    location = result.scalar_one_or_none()
+    if location is not None:
+        return location.id, False
+
+    if len(name) > MAX_NAME_LENGTH:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Submitted location name is longer than {MAX_NAME_LENGTH} characters "
+                "and doesn't match an existing clinic."
+            ),
+        )
+
+    new_location = Location(id=uuid.uuid4(), name=name)
+    db.add(new_location)
+    try:
+        await db.flush()  # assigns nothing extra here, but surfaces the
+        # unique-constraint violation now rather than at the caller's commit,
+        # so the race below can be handled in the same request.
+    except IntegrityError:
+        # Two deliveries for the same brand-new city landed at once; the
+        # second loses the race on the unique constraint — just use the
+        # row the first one created.
+        await db.rollback()
         result = await db.execute(
-            select(Location).where(
-                func.lower(Location.name) == func.lower(submitted.strip())
-            )
+            select(Location).where(func.lower(Location.name) == func.lower(name))
         )
         location = result.scalar_one_or_none()
         if location is not None:
-            return location.id
-
-    if settings.LEAD_WEBHOOK_DEFAULT_LOCATION_ID:
-        try:
-            fallback = uuid.UUID(settings.LEAD_WEBHOOK_DEFAULT_LOCATION_ID)
-        except ValueError:
-            raise HTTPException(
-                status_code=500,
-                detail="LEAD_WEBHOOK_DEFAULT_LOCATION_ID is not a valid UUID",
-            )
-        if await db.get(Location, fallback) is not None:
-            return fallback
-
-    known = (await db.execute(select(Location.name).order_by(Location.name))).scalars().all()
-    raise HTTPException(
-        status_code=422,
-        detail={
-            "message": (
-                "Could not match the submitted location to a clinic on record. "
-                "Send one of the known names, or set "
-                "LEAD_WEBHOOK_DEFAULT_LOCATION_ID."
-            ),
-            "submitted_location": submitted,
-            "known_locations": list(known),
-        },
-    )
+            return location.id, False
+        raise
+    return new_location.id, True
 
 
 @router.post(
@@ -124,7 +138,7 @@ async def receive_lead(
                 status="already_received", lead_id=already.id, duplicate=True
             )
 
-    location_id = await _resolve_location(db, payload.location)
+    location_id, location_created = await _resolve_location(db, payload.location)
 
     lead = Lead(
         id=uuid.uuid4(),
@@ -144,12 +158,18 @@ async def receive_lead(
     )
     db.add(lead)
 
+    body = f"{payload.name} submitted the website form."
+    if location_created:
+        # Flag it in the notification itself — a new location silently
+        # appearing in the dropdown is easy to miss; a bell notification with
+        # the submitted name isn't.
+        body += f' A new location, "{payload.location}", was added automatically.'
     await create_notification(
         db,
         NotificationCategory.CLIENT_MESSAGE,
         NotificationBadge.MESSAGE,
         title="New website enquiry",
-        body=f"{payload.name} submitted the website form.",
+        body=body,
         related_entity_type="lead",
         related_entity_id=lead.id,
         commit=False,
@@ -173,4 +193,7 @@ async def receive_lead(
         raise
 
     logger.info("Lead received from website webhook: %s (%s)", lead.id, payload.email)
-    return LeadWebhookResult(status="created", lead_id=lead.id, duplicate=False)
+    return LeadWebhookResult(
+        status="created", lead_id=lead.id, duplicate=False,
+        location_created=location_created,
+    )

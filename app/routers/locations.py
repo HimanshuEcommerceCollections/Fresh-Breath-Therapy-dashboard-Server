@@ -7,6 +7,7 @@ from app.database import get_db
 from app.models.location import Location
 from app.models.therapist import Therapist
 from app.models.client import Client
+from app.models.lead import Lead
 from app.schemas.location import LocationCreate, LocationResponse
 from app.models.user import User
 from app.dependencies.auth import get_current_user, require_admin
@@ -56,13 +57,20 @@ async def delete_location(
     client_count = (await db.execute(
         select(func.count(Client.id)).where(Client.location_id == location_id)
     )).scalar_one()
+    # leads.location_id is a NOT NULL FK — without this check, deleting a
+    # location that a lead still points to (e.g. one the lead webhook created
+    # automatically) would fail as an unhandled IntegrityError (500) instead
+    # of this clear 400.
+    lead_count = (await db.execute(
+        select(func.count(Lead.id)).where(Lead.location_id == location_id)
+    )).scalar_one()
 
-    if therapist_count or client_count:
+    if therapist_count or client_count or lead_count:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Cannot delete this location — it still has {therapist_count} therapist(s) "
-                f"and {client_count} client(s) assigned. Reassign them first."
+                f"Cannot delete this location — it still has {therapist_count} therapist(s), "
+                f"{client_count} client(s), and {lead_count} lead(s) assigned. Reassign them first."
             ),
         )
 
