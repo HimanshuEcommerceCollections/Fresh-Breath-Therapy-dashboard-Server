@@ -6,6 +6,7 @@ from app.schemas.base import ORMBase
 from app.schemas.location import LocationResponse
 from app.schemas.therapist import TherapistResponse
 from app.models.enums import LeadStatus
+from app.schemas.fields import PersonName, Email
 
 PHONE_PATTERN = re.compile(r"^[0-9+\-()\s]{7,20}$")
 
@@ -19,10 +20,10 @@ def _validate_phone(v: str | None) -> str | None:
 
 
 class LeadCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=200)
+    name: PersonName
     age: int | None = Field(default=None, ge=0, le=120)
     gender_or_pronoun: str | None = None
-    email: EmailStr
+    email: Email
     phone: str = Field(min_length=7, max_length=20)
     location_id: uuid.UUID
     therapist_id: uuid.UUID | None = None
@@ -33,10 +34,10 @@ class LeadCreate(BaseModel):
 
 
 class LeadUpdate(BaseModel):
-    name: str | None = Field(default=None, min_length=1, max_length=200)
+    name: PersonName | None = None
     age: int | None = Field(default=None, ge=0, le=120)
     gender_or_pronoun: str | None = None
-    email: EmailStr | None = None
+    email: Email | None = None
     phone: str | None = Field(default=None, min_length=7, max_length=20)
     location_id: uuid.UUID | None = None
     therapist_id: uuid.UUID | None = None
@@ -54,6 +55,10 @@ class LeadResponse(ORMBase):
     email: str
     phone: str
     source: str | None
+    # Captured by the public website form and delivered via the lead webhook.
+    message: str | None = None
+    preferred_datetime: str | None = None
+    consent_given: bool = False
     status: LeadStatus
     converted_client_id: uuid.UUID | None
     created_at: datetime

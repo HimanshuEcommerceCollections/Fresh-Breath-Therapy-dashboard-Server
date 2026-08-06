@@ -1,5 +1,6 @@
 from datetime import datetime
 from pydantic import BaseModel, EmailStr
+from app.schemas.fields import Email
 
 
 class OtpRequestResponse(BaseModel):
@@ -9,7 +10,7 @@ class OtpRequestResponse(BaseModel):
 
 
 class VerifyOtpRequest(BaseModel):
-    email: EmailStr
+    email: Email
     code: str
 
 
