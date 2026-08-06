@@ -30,7 +30,7 @@ from app.models.notification import NotificationCategory, NotificationBadge
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/webhooks", tags=["webhooks"])
+router = APIRouter(prefix="/api/12345678", tags=["webhooks"])
 
 
 def verify_webhook_secret(
