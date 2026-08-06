@@ -28,8 +28,12 @@ class PtoTransaction(Base):
     )
     hours: Mapped[float] = mapped_column(Numeric(6, 2), nullable=False)
     rate_applied: Mapped[float | None] = mapped_column(Numeric(4, 3), nullable=True)
+    # SET NULL, not the default RESTRICT: accrued PTO is a ledger entry that is
+    # never reversed (see pto_service), so deleting the session it came from
+    # must not claw back hours the therapist genuinely earned — nor 500 on a
+    # foreign-key violation, which is what RESTRICT did.
     source_session_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("sessions.id"), nullable=True
+        UUID(as_uuid=True), ForeignKey("sessions.id", ondelete="SET NULL"), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     DB_POOL_TIMEOUT: int = 15  # fail loudly instead of hanging indefinitely
     DB_POOL_RECYCLE: int = 1800
     DB_ECHO: bool = False  # SQL logging is very noisy; opt in per environment
+    # Costs one extra round trip per checkout (~1 RTT). Worth it in front of a
+    # pooler that silently drops idle connections; turn off if the DB is
+    # co-located and latency matters more than reconnect resilience.
+    DB_POOL_PRE_PING: bool = True
 
     class Config:
         env_file = ".env"
