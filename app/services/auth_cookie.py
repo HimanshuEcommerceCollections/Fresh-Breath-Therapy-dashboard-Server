@@ -1,7 +1,7 @@
 from fastapi import Response
+from app.config import settings
 
 ACCESS_TOKEN_COOKIE = "access_token"
-ACCESS_TOKEN_COOKIE_MAX_AGE = 60 * 60
 
 # Single source of truth for the access_token cookie's attributes. Every
 # login path (OTP verify, Google OAuth callback, any future one) MUST call
@@ -18,7 +18,18 @@ def set_auth_cookie(response: Response, token: str) -> None:
         httponly=True,
         samesite="none",
         secure=True,
-        max_age=ACCESS_TOKEN_COOKIE_MAX_AGE,
+        # Derived from the SAME setting that determines the JWT's own
+        # expiry (jwt_service.create_access_token), not a separate literal —
+        # a cookie that outlives its token just means the browser keeps
+        # sending a dead token until the user notices; a cookie that expires
+        # SOONER than the token forces a needless re-login even though the
+        # token would still have been valid. Previously hardcoded to 3600s
+        # regardless of this setting, so a shorter ACCESS_TOKEN_EXPIRE_MINUTES
+        # (e.g. set differently in a deployed environment) still left the
+        # cookie looking present for a full hour after the token inside it
+        # had already expired — every request "logged out" until that cookie
+        # aged out too.
+        max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
     )
 
 
