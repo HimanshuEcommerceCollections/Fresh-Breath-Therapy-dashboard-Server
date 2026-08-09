@@ -14,7 +14,7 @@ from app.services.email_service import send_otp_email
 logger = logging.getLogger(__name__)
 
 OTP_TTL_MINUTES = 5
-RESEND_COOLDOWN_SECONDS = 5  # TODO: revert to 5-minute cooldown (RESEND_COOLDOWN_MINUTES = 5) after testing
+RESEND_COOLDOWN_SECONDS = 5 * 60
 
 
 def _generate_code() -> str:
