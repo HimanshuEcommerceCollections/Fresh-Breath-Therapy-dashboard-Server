@@ -96,6 +96,19 @@ async def resend_otp(
     if not settings.EMAIL_SERVICE:
         raise HTTPException(status_code=400, detail="OTP verification is currently disabled")
 
+    # A login OTP must never go out to an account /login itself would refuse
+    # to authenticate — otherwise resend-otp is a way to reach every pending
+    # signup request's inbox regardless of the login endpoint's own gate.
+    # Signup-purpose OTPs are exempt: at signup time role_id is *always*
+    # still None (that's the normal, pre-approval state being verified), so
+    # this check would otherwise block the one case resend-otp legitimately
+    # exists for.
+    if payload["purpose"] == "login":
+        if user.role_id is None:
+            raise HTTPException(status_code=403, detail="Account pending admin approval")
+        if not user.is_active:
+            raise HTTPException(status_code=403, detail="Account is inactive")
+
     expires_at = await request_otp(db, user.id, user.email, purpose=payload["purpose"])
     return OtpRequestResponse(expires_at=expires_at)
 
