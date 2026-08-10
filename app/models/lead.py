@@ -42,6 +42,16 @@ class Lead(Base):
     # nullable because leads added by hand in the dashboard have no such id,
     # and Postgres allows many NULLs under a UNIQUE constraint.
     external_id: Mapped[str | None] = mapped_column(String, nullable=True, unique=True)
+    # The automation's own tracking fields ("Customer ID", "Payment Status",
+    # "Visit Status") — plain free text, not FK'd to anything or coupled to
+    # this app's own PaymentStatus enum (Enrollment.payment_status), since
+    # the automation's vocabulary for these is entirely its own and not
+    # guaranteed to line up. Nullable and NEVER set by LeadCreate/LeadUpdate
+    # (the admin-facing create/edit endpoints) — that's what keeps these
+    # empty for every lead except ones that arrived through the webhook.
+    customer_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    payment_status: Mapped[str | None] = mapped_column(String, nullable=True)
+    visit_status: Mapped[str | None] = mapped_column(String, nullable=True)
     converted_client_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("clients.id"), nullable=True
     )

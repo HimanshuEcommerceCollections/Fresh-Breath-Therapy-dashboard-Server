@@ -59,6 +59,11 @@ class LeadResponse(ORMBase):
     message: str | None = None
     preferred_datetime: str | None = None
     consent_given: bool = False
+    # The automation's own tracking fields — always None for leads added any
+    # other way (LeadCreate/LeadUpdate don't accept them).
+    customer_id: str | None = None
+    payment_status: str | None = None
+    visit_status: str | None = None
     status: LeadStatus
     converted_client_id: uuid.UUID | None
     created_at: datetime
