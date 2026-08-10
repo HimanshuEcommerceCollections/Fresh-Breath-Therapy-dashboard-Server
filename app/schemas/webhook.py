@@ -37,7 +37,7 @@ class LeadWebhookPayload(BaseModel):
         default=None, max_length=200,
         validation_alias=AliasChoices(
             "preferred_datetime", "preferred_date_time", "preferredDateTime",
-            "Preferred Date & Time", "preferred_date", "datetime",
+            "Preferred Date & Time", "preferred_date", "datetime", "Date Of Time",
         ),
     )
     message: str | None = Field(
@@ -64,6 +64,21 @@ class LeadWebhookPayload(BaseModel):
         validation_alias=AliasChoices(
             "external_id", "submission_id", "id", "entry_id", "record_id",
         ),
+    )
+    # Free-text tracking fields specific to this automation's own workflow —
+    # stored as given, never interpreted or validated against this app's own
+    # status vocabularies.
+    customer_id: str | None = Field(
+        default=None, max_length=200,
+        validation_alias=AliasChoices("customer_id", "customerId", "Customer ID"),
+    )
+    payment_status: str | None = Field(
+        default=None, max_length=100,
+        validation_alias=AliasChoices("payment_status", "paymentStatus", "Payment Status"),
+    )
+    visit_status: str | None = Field(
+        default=None, max_length=100,
+        validation_alias=AliasChoices("visit_status", "visitStatus", "Visit Status"),
     )
 
 

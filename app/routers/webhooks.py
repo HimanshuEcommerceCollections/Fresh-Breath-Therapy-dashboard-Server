@@ -8,12 +8,18 @@ endpoint sitting open to anyone who learns the URL.
 
 Flow: website form -> automation (saves to the spreadsheet) -> POST here ->
 lead row in the dashboard.
+
+Accepts either a single lead object or a JSON array of them — the
+automation's own payload is an array (its export format is row-based, even
+for one row), so a bare object would 422 on every real delivery if that
+shape weren't also allowed.
 """
 import hmac
 import logging
 import uuid
+from typing import Union
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Response, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
@@ -107,36 +113,28 @@ async def _resolve_location(db: AsyncSession, submitted: str | None) -> tuple[uu
     return new_location.id, True
 
 
-@router.post(
-    "/leads",
-    response_model=LeadWebhookResult,
-    status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(verify_webhook_secret)],
-)
-async def receive_lead(
-    payload: LeadWebhookPayload,
-    response: Response,
-    db: AsyncSession = Depends(get_db),
-):
-    """Create a lead from a website submission.
+async def _find_existing(db: AsyncSession, dedup_key: str | None) -> Lead | None:
+    if not dedup_key:
+        return None
+    result = await db.execute(select(Lead).where(Lead.external_id == dedup_key))
+    return result.scalar_one_or_none()
+
+
+async def _create_or_get_lead(payload: LeadWebhookPayload, db: AsyncSession) -> LeadWebhookResult:
+    """One payload in, one result out — commits its own transaction so one
+    bad row in a batch can't roll back the others.
 
     Idempotent on external_id: a redelivery (automation platforms retry on
-    timeout or a 5xx) returns the lead already created rather than a duplicate.
-    Without an external_id there is nothing to deduplicate on, so a retry WILL
-    produce a second lead — which is the right trade if the alternative is
-    guessing and dropping a genuine second enquiry from the same person.
+    timeout or a 5xx) returns the lead already created rather than a
+    duplicate. Falls back to customer_id when external_id isn't sent — the
+    automation's own per-submission id is just as good a dedup key, and using
+    it means retries are safe without asking for yet another field.
     """
-    if payload.external_id:
-        existing = await db.execute(
-            select(Lead).where(Lead.external_id == payload.external_id)
-        )
-        already = existing.scalar_one_or_none()
-        if already is not None:
-            # Nothing was created on a replay, so don't claim 201.
-            response.status_code = status.HTTP_200_OK
-            return LeadWebhookResult(
-                status="already_received", lead_id=already.id, duplicate=True
-            )
+    dedup_key = payload.external_id or payload.customer_id
+
+    already = await _find_existing(db, dedup_key)
+    if already is not None:
+        return LeadWebhookResult(status="already_received", lead_id=already.id, duplicate=True)
 
     location_id, location_created = await _resolve_location(db, payload.location)
 
@@ -153,7 +151,10 @@ async def receive_lead(
         message=payload.message,
         preferred_datetime=payload.preferred_datetime,
         consent_given=payload.consent_given,
-        external_id=payload.external_id,
+        external_id=dedup_key,
+        customer_id=payload.customer_id,
+        payment_status=payload.payment_status,
+        visit_status=payload.visit_status,
         status=LeadStatus.NEW_LEAD,
     )
     db.add(lead)
@@ -178,18 +179,12 @@ async def receive_lead(
     try:
         await db.commit()
     except IntegrityError:
-        # Two deliveries of the same external_id racing each other: the unique
+        # Two deliveries of the same dedup key racing each other: the unique
         # constraint is the real guard, the SELECT above is just the fast path.
         await db.rollback()
-        existing = await db.execute(
-            select(Lead).where(Lead.external_id == payload.external_id)
-        )
-        already = existing.scalar_one_or_none()
+        already = await _find_existing(db, dedup_key)
         if already is not None:
-            response.status_code = status.HTTP_200_OK
-            return LeadWebhookResult(
-                status="already_received", lead_id=already.id, duplicate=True
-            )
+            return LeadWebhookResult(status="already_received", lead_id=already.id, duplicate=True)
         raise
 
     logger.info("Lead received from website webhook: %s (%s)", lead.id, payload.email)
@@ -197,3 +192,36 @@ async def receive_lead(
         status="created", lead_id=lead.id, duplicate=False,
         location_created=location_created,
     )
+
+
+LeadWebhookBody = Union[LeadWebhookPayload, list[LeadWebhookPayload]]
+
+
+@router.post(
+    "/leads",
+    dependencies=[Depends(verify_webhook_secret)],
+)
+async def receive_lead(
+    response: Response,
+    payload: LeadWebhookBody = Body(...),
+    db: AsyncSession = Depends(get_db),
+):
+    items = payload if isinstance(payload, list) else [payload]
+    if not items:
+        raise HTTPException(status_code=422, detail="Empty payload")
+
+    results = [await _create_or_get_lead(item, db) for item in items]
+
+    # A single object in -> a single object out, matching the documented
+    # single-lead contract exactly. An array in (even one element, which is
+    # what the automation actually sends) -> an array out.
+    if not isinstance(payload, list):
+        result = results[0]
+        response.status_code = status.HTTP_200_OK if result.duplicate else status.HTTP_201_CREATED
+        return result
+
+    response.status_code = (
+        status.HTTP_201_CREATED if any(not r.duplicate for r in results)
+        else status.HTTP_200_OK
+    )
+    return results
