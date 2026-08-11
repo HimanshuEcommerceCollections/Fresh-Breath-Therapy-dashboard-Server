@@ -18,3 +18,4 @@ from app.models.idempotency_key import IdempotencyKey
 from app.models.notification import Notification
 from app.models.client_message import ClientMessage
 from app.models.revoked_token import RevokedToken
+from app.models.import_batch import ImportBatch, ImportRow

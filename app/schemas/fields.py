@@ -9,12 +9,15 @@ stricter than the spec and will reject some genuine long addresses (a few
 corporate and university ones exceed 50). That's a deliberate product
 decision — adjust MAX_EMAIL_LENGTH here and it applies everywhere at once.
 """
+import re
 from typing import Annotated
 
 from pydantic import EmailStr, Field, StringConstraints
 
 MAX_NAME_LENGTH = 50
 MAX_EMAIL_LENGTH = 50
+MIN_PHONE_LENGTH = 7
+MAX_PHONE_LENGTH = 20
 
 # strip_whitespace so " Jane " can't sneak past the limit or get stored padded.
 ShortName = Annotated[
@@ -28,3 +31,26 @@ ShortName = Annotated[
 PersonName = ShortName
 
 Email = Annotated[EmailStr, Field(max_length=MAX_EMAIL_LENGTH)]
+
+# Permissive about formatting, strict only about length and character set:
+# the dashboard renders this string exactly as it was typed, and real numbers
+# arrive as "919-300-6717", "(919) 555 0134" and "+1 919 555 0100" alike.
+PHONE_PATTERN = re.compile(
+    rf"^[0-9+\-()\s]{{{MIN_PHONE_LENGTH},{MAX_PHONE_LENGTH}}}$"
+)
+
+
+def validate_phone(v: str | None) -> str | None:
+    """Shared by leads and clients — both collect the same phone number, and
+    they must not disagree about what counts as a valid one."""
+    if v is not None and not PHONE_PATTERN.match(v):
+        raise ValueError(
+            f"Phone number must be {MIN_PHONE_LENGTH}-{MAX_PHONE_LENGTH} "
+            "characters, using only digits, spaces, +, -, or parentheses"
+        )
+    return v
+
+
+Phone = Annotated[
+    str, Field(min_length=MIN_PHONE_LENGTH, max_length=MAX_PHONE_LENGTH)
+]

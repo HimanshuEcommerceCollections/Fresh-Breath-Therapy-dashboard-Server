@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, date, time
-from sqlalchemy import Date, Time, DateTime, ForeignKey, Enum, func
+from sqlalchemy import String, Date, Time, DateTime, ForeignKey, Enum, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID
 
@@ -14,6 +14,8 @@ class Session(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
+    # See models/import_batch.py — spreadsheet-import identity.
+    external_ref: Mapped[str | None] = mapped_column(String, nullable=True, unique=True)
     client_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("clients.id"), nullable=False
     )

@@ -16,6 +16,9 @@ class Therapist(Base):
     user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
+    # See models/import_batch.py — spreadsheet-import identity, written back
+    # into the source sheet. NULL for therapists added in the dashboard.
+    external_ref: Mapped[str | None] = mapped_column(String, nullable=True, unique=True)
     name: Mapped[str] = mapped_column(String, nullable=False)
     credential: Mapped[str | None] = mapped_column(String, nullable=True)
     # Free text, e.g. "Anxiety, CBT" — the Add/Edit Therapist form has always

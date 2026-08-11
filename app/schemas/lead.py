@@ -1,4 +1,3 @@
-import re
 import uuid
 from datetime import datetime
 from pydantic import BaseModel, EmailStr, Field, field_validator
@@ -6,17 +5,9 @@ from app.schemas.base import ORMBase
 from app.schemas.location import LocationResponse
 from app.schemas.therapist import TherapistResponse
 from app.models.enums import LeadStatus
-from app.schemas.fields import PersonName, Email
-
-PHONE_PATTERN = re.compile(r"^[0-9+\-()\s]{7,20}$")
-
-
-def _validate_phone(v: str | None) -> str | None:
-    if v is not None and not PHONE_PATTERN.match(v):
-        raise ValueError(
-            "Phone number must be 7-20 characters, using only digits, spaces, +, -, or parentheses"
-        )
-    return v
+# The phone rule moved to fields.py when clients gained a phone column too —
+# one definition, so the two entry points can't drift apart.
+from app.schemas.fields import PersonName, Email, validate_phone as _validate_phone
 
 
 class LeadCreate(BaseModel):

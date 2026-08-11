@@ -17,8 +17,17 @@ class Client(Base):
     user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
     )
+    # Stable identity for spreadsheet-imported rows. The importer generates
+    # it, then writes it back into the source sheet, so a later sync of the
+    # same file recognises this row however it has been re-sorted since.
+    # NULL for clients created in the dashboard. See models/import_batch.py.
+    external_ref: Mapped[str | None] = mapped_column(String, nullable=True, unique=True)
     name: Mapped[str] = mapped_column(String, nullable=False)
     email: Mapped[str] = mapped_column(String, nullable=False)
+    # Nullable, unlike Lead.phone: clients converted before this column
+    # existed have none on file, and a historical spreadsheet row may not
+    # carry one either. Required-ness is a data-entry rule, not a schema one.
+    phone: Mapped[str | None] = mapped_column(String, nullable=True)
     therapist_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("therapists.id"), nullable=False
     )

@@ -168,6 +168,10 @@ async def convert_lead(
         id=uuid.uuid4(),
         name=lead.name,
         email=lead.email,
+        # Carried across deliberately: the lead form is where the phone number
+        # is collected, and before clients had this column, converting a lead
+        # silently discarded the only number anyone had for them.
+        phone=lead.phone,
         therapist_id=lead.therapist_id,
         location_id=lead.location_id,
     )

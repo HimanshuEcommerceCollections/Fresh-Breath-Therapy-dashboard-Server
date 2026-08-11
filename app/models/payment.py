@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, date
-from sqlalchemy import Numeric, Date, DateTime, ForeignKey, Enum, Index, func
+from sqlalchemy import Numeric, String, Date, DateTime, ForeignKey, Enum, Index, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID
 
@@ -26,6 +26,10 @@ class Payment(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
+    # See models/import_batch.py. The ledger is append-only, so on a re-sync
+    # this is what proves a transaction has already been imported and must
+    # not be added a second time.
+    external_ref: Mapped[str | None] = mapped_column(String, nullable=True, unique=True)
     enrollment_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("enrollments.id"), nullable=False
     )
