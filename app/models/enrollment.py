@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 from decimal import Decimal
-from sqlalchemy import Boolean, Numeric, DateTime, ForeignKey, Enum, Index, func
+from sqlalchemy import Boolean, Numeric, String, DateTime, ForeignKey, Enum, Index, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID
 
@@ -28,6 +28,8 @@ class Enrollment(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
+    # See models/import_batch.py — spreadsheet-import identity.
+    external_ref: Mapped[str | None] = mapped_column(String, nullable=True, unique=True)
     client_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("clients.id"), nullable=False
     )
