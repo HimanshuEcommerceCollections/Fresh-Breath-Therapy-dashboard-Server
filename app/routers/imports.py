@@ -59,6 +59,17 @@ router = APIRouter(prefix="/api/imports", tags=["imports"])
 # larger is a mistake and should fail before it is read into memory.
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
+# Review-list ordering: whatever needs the admin's attention comes first, and
+# the rows that will simply work come last.
+ROW_SEVERITY = {
+    ImportRowStatus.ERROR.value: 0,
+    ImportRowStatus.FAILED.value: 0,
+    ImportRowStatus.NEEDS_INPUT.value: 1,
+    ImportRowStatus.UPDATE.value: 2,   # changes an existing record — worth a look
+    ImportRowStatus.CREATE.value: 3,
+    ImportRowStatus.SKIP.value: 4,     # nothing changes; least interesting
+}
+
 _SHEETS_ID = re.compile(r"docs\.google\.com/spreadsheets/d/([a-zA-Z0-9-_]+)")
 # Google puts the active tab in the URL fragment ("#gid=123456789"). Without
 # this the export silently returns the FIRST tab, so an admin who copied the
@@ -798,6 +809,14 @@ async def preview_import(
         blockers.append("Nothing to import — every row is a skip or an error")
 
     shown = [v for v in verdicts if (only is None or v.status == only)]
+    # Problems first, then row order within each group.
+    #
+    # Not only so the admin doesn't scroll past 148 successes to reach 2
+    # failures — the response is capped at `limit` rows, so ordering purely by
+    # row number would let an error on line 4,000 of a 5,000-row sheet fall
+    # outside the returned slice entirely. The counts would report it and the
+    # list would not contain it, which is the worst of both.
+    shown.sort(key=lambda v: (ROW_SEVERITY.get(v.status, 99), v.row_number))
     return ImportPreview(
         batch=ImportBatchSummary.model_validate(batch),
         counts=counts,
