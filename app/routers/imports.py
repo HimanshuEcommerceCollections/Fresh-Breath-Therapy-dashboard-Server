@@ -763,9 +763,33 @@ async def _preview_from_stored(
         return None
 
     entity = get_entity(batch.entity)
-    normalized_preview = [
-        (row.row_number, dict(row.normalized_payload or {})) for row in stored
-    ]
+
+    # Re-normalize from raw_payload. NOT from normalized_payload.
+    #
+    # After a successful preview the stored normalized_payload holds the
+    # *resolved* foreign key — an id — because that is what the commit needs.
+    # resolve_foreign_keys expects the name as written in the sheet. Feeding it
+    # the stored payload therefore asked it to look up ids as names, and every
+    # group came back "No therapist named 019ff702-92a1-7002-…" — the id we had
+    # ourselves resolved one request earlier, quoted back as if the sheet had
+    # contained it.
+    #
+    # It only bit on the second preview of a batch, because the first one takes
+    # the full path and populates the cache this reads. That made a clean
+    # import look like it had spontaneously lost every therapist.
+    #
+    # Normalising here costs no extra query — raw_payload and overrides are
+    # already on the rows this function loaded — and it is what keeps the
+    # promise in the docstring above: a shortcut, never a different answer.
+    normalized_preview = []
+    for row in stored:
+        values, _ = validator.normalize_row(
+            entity, row.raw_payload, batch.column_mapping or {},
+            date_order=batch.date_order, value_mapping=batch.value_mapping,
+            overrides=row.overrides or None,
+        )
+        normalized_preview.append((row.row_number, values))
+
     fk = await resolver.resolve_foreign_keys(
         db, batch.entity, normalized_preview,
         decisions=_saved_group_decisions(batch),
