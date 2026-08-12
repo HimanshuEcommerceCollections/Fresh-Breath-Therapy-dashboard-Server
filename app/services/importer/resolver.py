@@ -234,6 +234,48 @@ def _candidates(target: str, matches: list) -> list[FkCandidate]:
     return [FkCandidate(id=str(m.id), label=_label(target, m)) for m in matches]
 
 
+def _as_uuid(value) -> uuid.UUID | None:
+    """The value as a UUID, or None if it isn't one.
+
+    An FK cell normally holds the name written in the sheet. It can also hold
+    an id, because the review screen's pickers select by id on purpose — two
+    therapists share a name, so picking by label would silently choose
+    whichever came first. That choice is saved as a row override, which
+    replaces the cell before normalisation, so the resolver legitimately sees
+    an id where a name usually is.
+
+    Without this the id was looked up as a name, matched nothing, and the
+    admin was shown "No therapist named 019ff702-92a1-700e-…" — their own
+    correction, quoted back at them as if the sheet had contained it.
+    """
+    if value is None:
+        return None
+    try:
+        return uuid.UUID(str(value).strip())
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+async def _load_by_ids(db: AsyncSession, target: str, ids: set[uuid.UUID]) -> dict[str, object]:
+    """Records of `target` by id, for FK cells that already hold one.
+
+    Separate from _load_index because that one is keyed by NAME and bounded by
+    the names the sheet mentions — an id matches neither, so a picker's answer
+    would fall straight through it into "not found".
+    """
+    if not ids:
+        return {}
+    model = MODELS[target]
+    query = select(model).where(model.id.in_(ids))
+    if target == "therapists":
+        query = query.options(selectinload(Therapist.location))
+    elif target == "clients":
+        query = query.options(
+            selectinload(Client.location), selectinload(Client.therapist)
+        )
+    return {str(row.id): row for row in (await db.execute(query)).scalars().all()}
+
+
 def _read_attr(obj, attr: str) -> str:
     """Read a disambiguating attribute off a record as a comparable string."""
     value = getattr(obj, attr, None)
@@ -324,16 +366,32 @@ async def resolve_foreign_keys(
     # Collect the names the sheet mentions FIRST, so each entity is fetched
     # bounded by the import rather than by the size of the table.
     wanted: dict[str, set[str]] = {}
+    # FK cells that already hold an id rather than a name. The review screen's
+    # pickers select by id deliberately — two therapists share a name, so
+    # choosing by label would silently pick whichever came first — and that
+    # answer is saved as a row override, which replaces the cell. So an id here
+    # is a legitimate, already-answered reference, not a lookup that failed.
+    wanted_ids: dict[str, set[uuid.UUID]] = {}
     for spec in fk_specs:
         bucket = wanted.setdefault(spec.fk_entity, set())
+        id_bucket = wanted_ids.setdefault(spec.fk_entity, set())
         for _, values in rows:
             raw = values.get(spec.name)
-            if raw is not None and str(raw).strip():
+            if raw is None or not str(raw).strip():
+                continue
+            as_id = _as_uuid(raw)
+            if as_id is not None:
+                id_bucket.add(as_id)
+            else:
                 bucket.add(str(raw).strip())
 
     targets = {spec.fk_entity for spec in fk_specs}
     indexes = {
         target: await _load_index(db, target, wanted.get(target))
+        for target in targets
+    }
+    by_id = {
+        target: await _load_by_ids(db, target, wanted_ids.get(target, set()))
         for target in targets
     }
 
@@ -360,15 +418,37 @@ async def resolve_foreign_keys(
         read_disambiguator = DISAMBIGUATOR_OF.get(spec.fk_entity)
 
         # Bucket the rows: name -> disambiguator value -> [(row_number, values)]
+        target_by_id = by_id.get(spec.fk_entity, {})
         buckets: dict[str, dict[str, list[tuple[int, dict]]]] = {}
+        # name -> the already-identified record, for cells that held an id
+        resolved_by_id: dict[str, tuple[object, list[tuple[int, dict]]]] = {}
+
         for row_number, values in rows:
             raw = values.get(spec.name)
             if raw is None or not str(raw).strip():
                 continue
+
+            # A cell holding a known id is already answered. Group it under
+            # the record's real NAME so the screen reads "Chris Curtis —
+            # resolved" rather than echoing a UUID at the admin.
+            as_id = _as_uuid(raw)
+            if as_id is not None and str(as_id) in target_by_id:
+                record = target_by_id[str(as_id)]
+                entry = resolved_by_id.setdefault(record.name, (record, []))
+                entry[1].append((row_number, values))
+                continue
+
             name = str(raw).strip()
             context = _context_value(entity, spec, values, indexes)
             buckets.setdefault(name, {}).setdefault(context, []).append(
                 (row_number, values)
+            )
+
+        for name, (record, entries) in resolved_by_id.items():
+            _emit(
+                groups, row_assignments, row_groups, spec, name, None,
+                entries, FkStatus.RESOLVED, resolved_id=str(record.id),
+                decisions=decisions, row_decisions=row_decisions,
             )
 
         for name, by_context in buckets.items():
