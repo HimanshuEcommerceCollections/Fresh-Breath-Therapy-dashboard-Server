@@ -54,9 +54,11 @@ from app.models.import_batch import (  # noqa: E402
     ImportBatch, ImportRow, ImportStatus,
 )
 from app.models.lead import Lead  # noqa: E402
+from app.models.follow_up import FollowUp
 from app.models.location import Location  # noqa: E402
 from app.models.package import Package  # noqa: E402
-from app.models.payment import Payment  # noqa: E402
+from app.models.payment import Payment
+from app.models.pto_transaction import PtoTransaction  # noqa: E402
 from app.models.session import Session  # noqa: E402
 from app.models.therapist import Therapist  # noqa: E402
 from app.services.importer import commit as commit_service  # noqa: E402
@@ -169,6 +171,21 @@ FIXTURES: dict[str, dict] = {
             ],
         ),
     },
+    # Mixes open and completed rows, and every spelling of a boolean a human
+    # sheet actually contains, since `reminder` is the only BOOL column in the
+    # whole differential.
+    "follow_ups": {
+        "sheet": sheet(
+            ["Client", "Follow Up Date", "Notes", "Send Reminder", "Completed Date"],
+            [
+                [f"{P} Cli {i % 2}", f"2024-06-{(i % 27) + 1:02d}",
+                 f"Note {i}",
+                 ["Yes", "No", "TRUE", "false", "Y", "N"][i % 6],
+                 f"2024-07-{(i % 27) + 1:02d}" if i % 3 == 0 else ""]
+                for i in range(8)
+            ],
+        ),
+    },
 }
 
 # Columns compared, per entity. FKs resolved to the referenced row's NAME so a
@@ -223,6 +240,11 @@ DUMPS: dict[str, str] = {
         WHERE c.name LIKE '{P}%'
         ORDER BY c.name, p.name, pay.date, pay.amount_paid
     """,
+    "follow_ups": f"""
+        SELECT c.name AS client, f.due_date, f.notes, f.reminder, f.completed_at
+        FROM follow_ups f JOIN clients c ON c.id = f.client_id
+        WHERE c.name LIKE '{P}%' ORDER BY c.name, f.due_date
+    """,
     "sessions": f"""
         SELECT c.name AS client, t.name AS therapist,
                tl.name AS therapist_location, s.date, s.time, s.type, s.status
@@ -243,10 +265,11 @@ NATURAL_KEY_COLS: dict[str, tuple[int, ...]] = {
     "enrollments": (0, 1, 8),      # client, package, started_at
     "payments": (0, 1, 5, 2),      # client, package, date, amount
     "sessions": (0, 3, 4),         # client, date, time
+    "follow_ups": (0, 1),          # client, due_date
 }
 
 ORDER = ["locations", "therapists", "packages", "clients", "leads",
-         "enrollments", "payments", "sessions"]
+         "enrollments", "payments", "sessions", "follow_ups"]
 
 
 # ── scratch state ─────────────────────────────────────────────────────────
@@ -264,8 +287,16 @@ async def wipe(db) -> None:
         await db.execute(delete(Payment).where(Payment.client_id.in_(clients)))
         await db.execute(delete(Enrollment).where(Enrollment.client_id.in_(clients)))
         await db.execute(delete(Session).where(Session.client_id.in_(clients)))
+        await db.execute(delete(FollowUp).where(FollowUp.client_id.in_(clients)))
     if therapists:
         await db.execute(delete(Session).where(Session.therapist_id.in_(therapists)))
+        # Imported completed sessions now accrue PTO, and
+        # pto_transactions.therapist_id RESTRICTs — so without this the
+        # therapist delete below fails and every later entity inherits the
+        # mess as a cleanup failure rather than its own verdict.
+        await db.execute(
+            delete(PtoTransaction).where(PtoTransaction.therapist_id.in_(therapists))
+        )
     if packages:
         await db.execute(delete(Payment).where(Payment.package_id.in_(packages)))
         await db.execute(delete(Enrollment).where(Enrollment.package_id.in_(packages)))

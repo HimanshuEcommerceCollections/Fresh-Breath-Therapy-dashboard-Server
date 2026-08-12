@@ -2,7 +2,7 @@ import uuid
 from decimal import Decimal
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import delete, select, func
 from sqlalchemy.orm import selectinload
 from app.services.cloudinary_service import upload_avatar
 from app.services.pto_service import get_pto_balances_by_therapist, get_ytd_completed_sessions_by_therapist
@@ -11,6 +11,7 @@ from app.models.therapist import Therapist
 from app.models.location import Location
 from app.models.client import Client
 from app.models.payment import Payment
+from app.models.pto_transaction import PtoTransaction
 from app.models.enums import ClientStatus
 from app.schemas.therapist import TherapistCreate, TherapistUpdate, TherapistResponse
 from app.models.user import User
@@ -169,6 +170,22 @@ async def delete_therapist(
             detail="Cannot delete a therapist record that has ever been linked to a user login — this preserves historical session/payment data",
         )
 
+    # Drop their PTO ledger first. pto_transactions.therapist_id has no
+    # ondelete, so Postgres RESTRICTs the delete while any row references the
+    # therapist and the endpoint 500s on a raw foreign-key violation.
+    #
+    # This became reachable when the importer started accruing PTO for imported
+    # completed sessions: previously a therapist only had ledger rows if
+    # sessions had been completed through the dashboard, so a freshly imported
+    # therapist had none and deleted cleanly. Now they do.
+    #
+    # Deleting is right rather than orphaning: the ledger is per-therapist and
+    # means nothing without them, and this endpoint already refuses anyone ever
+    # linked to a login — so whatever gets here is a record with no history
+    # worth preserving.
+    await db.execute(
+        delete(PtoTransaction).where(PtoTransaction.therapist_id == therapist_id)
+    )
     await db.delete(therapist)
     await db.commit()
 

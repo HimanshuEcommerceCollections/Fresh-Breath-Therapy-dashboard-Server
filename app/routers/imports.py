@@ -322,12 +322,23 @@ async def list_entities(
     exists — which would otherwise fail every row on a NOT NULL foreign key
     and look like the importer was broken.
     """
-    counts: dict[str, int] = {}
-    for key in ENTITY_ORDER:
-        spec = REGISTRY[key]
-        counts[key] = int(
-            await db.scalar(select(func.count()).select_from(spec.model)) or 0
-        )
+    # One round trip for every count, not one per entity.
+    #
+    # This was a COUNT(*) per entity in a loop — nine sequential queries to
+    # render one screen. On this deployment a round trip to the database is
+    # ~500ms (the function runs in iad1, the database is in ap-southeast-1),
+    # so the loop cost roughly four and a half seconds of skeleton before the
+    # picker appeared, and grew by another half-second each time an entity was
+    # added. As scalar subqueries in a single SELECT it is one round trip
+    # regardless of how many entities the registry grows to.
+    count_query = select(*[
+        select(func.count()).select_from(REGISTRY[key].model).scalar_subquery().label(key)
+        for key in ENTITY_ORDER
+    ])
+    row = (await db.execute(count_query)).one()
+    counts: dict[str, int] = {
+        key: int(value or 0) for key, value in zip(ENTITY_ORDER, row)
+    }
 
     out = []
     for key in ENTITY_ORDER:

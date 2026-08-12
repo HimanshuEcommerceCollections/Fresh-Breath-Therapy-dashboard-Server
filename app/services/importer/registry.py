@@ -19,6 +19,7 @@ from dataclasses import dataclass, field as dc_field
 
 from app.models.client import Client
 from app.models.enrollment import Enrollment
+from app.models.follow_up import FollowUp
 from app.models.enums import (
     ClientStatus, EnrollmentStatus, LeadStatus, PaymentMethod,
     SessionStatus, SessionType,
@@ -30,6 +31,7 @@ from app.models.payment import Payment
 from app.models.session import Session
 from app.models.therapist import Therapist
 from app.schemas.fields import MAX_EMAIL_LENGTH, MAX_NAME_LENGTH
+from app.schemas.follow_up import MAX_NOTES_LENGTH
 
 
 class FieldKind(str, enum.Enum):
@@ -413,17 +415,65 @@ SESSIONS = EntitySpec(
 )
 
 
+FOLLOW_UPS = EntitySpec(
+    key="follow_ups",
+    label="Follow-ups",
+    model=FollowUp,
+    depends_on=("clients",),
+    # One outstanding follow-up per client per due date. Two rows with the same
+    # pair is a duplicated sheet line, not a second genuine task — the same
+    # reasoning as sessions being keyed on (client, date, time).
+    natural_key=("client", "due_date"),
+    fields=(
+        FieldSpec("client", "Client", FieldKind.FK, required=True,
+                  fk_entity="clients",
+                  aliases=("client name", "patient", "patient name", "who")),
+        FieldSpec("due_date", "Due date", FieldKind.DATE, required=True,
+                  aliases=("due", "date", "follow up date", "follow-up date",
+                           "next contact", "call back", "callback date",
+                           "reminder date", "when")),
+        # Same 40-character ceiling the API enforces, imported from the schema
+        # rather than repeated — a sheet that could write 200 characters here
+        # would create rows the follow-ups UI cannot edit without truncating.
+        FieldSpec("notes", "Notes", FieldKind.TEXT,
+                  max_length=MAX_NOTES_LENGTH,
+                  aliases=("note", "comment", "comments", "remark", "remarks",
+                           "details", "reason")),
+        FieldSpec("reminder", "Reminder", FieldKind.BOOL,
+                  aliases=("send reminder", "reminder set", "remind",
+                           "notify", "alert")),
+        # INSERT_ONLY: completion is workflow state driven by people working
+        # the follow-ups page. History lands with it on first import; a stale
+        # sheet must never re-open a task the team has already closed, or
+        # silently close one they are still working.
+        FieldSpec("completed_at", "Completed on", FieldKind.DATE,
+                  writable=Writability.INSERT_ONLY,
+                  aliases=("completed", "completed date", "done", "done on",
+                           "closed", "closed date", "resolved")),
+    ),
+    notes=(
+        "Leave 'Completed on' empty for follow-ups that are still open.",
+        "Notes are capped at 40 characters, matching the dashboard.",
+    ),
+)
+
+
 # Ordered: the picker renders it top to bottom, and it is a valid topological
 # order, so following it never hits an unresolvable foreign key.
+#
+# Append-only. _entity_lock_key indexes into this tuple to derive each entity's
+# advisory-lock id, so inserting in the middle would renumber the others and a
+# deploy mid-import could have two runs holding different keys for the same
+# table.
 ENTITY_ORDER: tuple[str, ...] = (
     "locations", "therapists", "packages", "clients",
-    "leads", "enrollments", "payments", "sessions",
+    "leads", "enrollments", "payments", "sessions", "follow_ups",
 )
 
 REGISTRY: dict[str, EntitySpec] = {
     spec.key: spec
     for spec in (LOCATIONS, THERAPISTS, PACKAGES, CLIENTS,
-                 LEADS, ENROLLMENTS, PAYMENTS, SESSIONS)
+                 LEADS, ENROLLMENTS, PAYMENTS, SESSIONS, FOLLOW_UPS)
 }
 
 
