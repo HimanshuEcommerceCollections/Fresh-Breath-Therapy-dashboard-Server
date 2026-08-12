@@ -1,7 +1,7 @@
 import uuid
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import selectinload
 from app.database import get_db
 from app.models.session import Session
@@ -49,6 +49,23 @@ async def search_sessions(
         query = query.where(Session.client_id == payload.client_id)
     if payload.status:
         query = query.where(Session.status == payload.status)
+
+    if payload.search and payload.search.strip():
+        # Matched against both names, because the admin remembers one of them
+        # and not which. EXISTS subqueries rather than joins: a join would
+        # duplicate rows and, more importantly, interfere with the keyset
+        # pagination applied below, which assumes one row per session.
+        term = f"%{payload.search.strip()}%"
+        query = query.where(
+            or_(
+                Session.client_id.in_(
+                    select(Client.id).where(Client.name.ilike(term))
+                ),
+                Session.therapist_id.in_(
+                    select(Therapist.id).where(Therapist.name.ilike(term))
+                ),
+            )
+        )
     if payload.date_from:
         query = query.where(Session.date >= payload.date_from)
     if payload.date_to:
@@ -135,10 +152,26 @@ async def update_session(
 
     update_data = payload.model_dump(exclude_unset=True)
 
+    # Reassignment: verify the new records exist before anything is written,
+    # so a bad id is a clear 400 rather than a foreign-key violation.
+    if update_data.get("therapist_id"):
+        if await db.get(Therapist, update_data["therapist_id"]) is None:
+            raise HTTPException(status_code=400, detail="Therapist does not exist")
+    if update_data.get("client_id"):
+        if await db.get(Client, update_data["client_id"]) is None:
+            raise HTTPException(status_code=400, detail="Client does not exist")
+
     new_date = update_data.get("date", session.date)
     new_time = update_data.get("time", session.time)
-    if "date" in update_data or "time" in update_data:
-        await check_double_booking(db, session.therapist_id, new_date, new_time, exclude_session_id=session.id)
+    # Checked against the NEW therapist, not the old one. Moving a session to
+    # a different clinician has to be validated against THAT clinician's
+    # calendar — using the outgoing therapist's would let two sessions land on
+    # the same person at the same time.
+    new_therapist_id = update_data.get("therapist_id", session.therapist_id)
+    if {"date", "time", "therapist_id"} & update_data.keys():
+        await check_double_booking(
+            db, new_therapist_id, new_date, new_time, exclude_session_id=session.id
+        )
 
     previously_completed = session.status == SessionStatus.COMPLETED
 
