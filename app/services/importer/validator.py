@@ -29,7 +29,7 @@ from dataclasses import dataclass, field as dc_field
 from datetime import date, datetime, time
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.enrollment import Enrollment
@@ -232,7 +232,8 @@ def natural_key(entity: EntitySpec, values: dict) -> str | None:
 
 
 async def load_existing_index(
-    db: AsyncSession, entity: EntitySpec
+    db: AsyncSession, entity: EntitySpec,
+    normalized_rows: list[dict] | None = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
     """(by_external_ref, by_natural_key) over every existing row.
 
@@ -240,14 +241,65 @@ async def load_existing_index(
     through a Supabase pooler capped at 15 clients cannot afford per-row
     lookups.
     """
-    result = await db.execute(select(entity.model))
-    rows = result.scalars().all()
+    query = select(entity.model)
+
+    # Bound the read by the sheet where we safely can.
+    #
+    # The natural key is a COMPOSITE ("name|email"), and reconstructing that in
+    # SQL differs per entity — so instead this filters on the individual key
+    # COLUMNS with an OR, which is a superset of the rows that could match.
+    # A superset is the point: the composite keys are still built in Python
+    # exactly as before, so no verdict can change, but the rows crossing the
+    # wire become proportional to the import rather than to the clinic.
+    #
+    # Only text-ish columns are filtered. Dates and money in a natural key
+    # (payments) are left unconstrained rather than risk a type mismatch
+    # silently excluding a row that should have matched — being a looser
+    # superset costs bandwidth, being a subset would cost correctness.
+    if normalized_rows:
+        conditions = []
+        for name in entity.natural_key:
+            spec = entity.field(name)
+            if spec is None or spec.kind not in (
+                FieldKind.TEXT, FieldKind.EMAIL, FieldKind.FK
+            ):
+                continue
+            column = entity.model.__table__.columns.get(
+                model_attr(name, spec.kind)
+            )
+            if column is None:
+                continue
+            values = {
+                _key_part(v.get(name)) for v in normalized_rows
+                if v.get(name) not in (None, "")
+            }
+            if not values:
+                continue
+            if spec.kind is FieldKind.FK:
+                conditions.append(column.in_([uuid.UUID(v) for v in values]))
+            else:
+                conditions.append(func.lower(column).in_(values))
+
+        ref_name = "external_id" if entity.key == "leads" else "external_ref"
+        ref_col = entity.model.__table__.columns.get(ref_name)
+        if ref_col is not None:
+            refs = {
+                str(v.get(ref_name)) for v in normalized_rows if v.get(ref_name)
+            }
+            if refs:
+                conditions.append(ref_col.in_(refs))
+
+        if conditions:
+            query = query.where(or_(*conditions))
+
+    result = await db.execute(query)
+    rows_found = result.scalars().all()
 
     ref_column = "external_id" if entity.key == "leads" else "external_ref"
     by_ref: dict[str, object] = {}
     by_key: dict[str, object] = {}
 
-    for row in rows:
+    for row in rows_found:
         ref = getattr(row, ref_column, None)
         if ref:
             by_ref[str(ref)] = row
@@ -379,7 +431,11 @@ async def validate_rows(
     entity = get_entity(entity_key)
     fk = fk or FkResolution(groups={}, row_assignments={})
     overrides_by_row = overrides_by_row or {}
-    by_ref, by_key = await load_existing_index(db, entity)
+    # Bounded by the sheet only when the normalized values are in hand;
+    # the standalone path has none and falls back to the full read.
+    by_ref, by_key = await load_existing_index(
+        db, entity, [v[0] for v in prepared.values()] if prepared else None
+    )
     ref_field = "external_id" if entity.key == "leads" else "external_ref"
     # Only enrollments have a one-active-cycle rule; None everywhere else
     # keeps the check out of the hot loop entirely.
