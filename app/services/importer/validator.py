@@ -355,6 +355,7 @@ async def validate_rows(
     fk: FkResolution | None = None,
     migration_mode: bool = False,
     overrides_by_row: dict[int, dict] | None = None,
+    prepared: dict[int, tuple[dict, list[dict]]] | None = None,
 ) -> list[RowVerdict]:
     """Validate a whole batch. Reads the database; writes nothing.
 
@@ -367,6 +368,13 @@ async def validate_rows(
     A row whose name is still ambiguous or missing becomes NEEDS_INPUT rather
     than ERROR — it isn't the row that's wrong, it's a question nobody has
     answered yet.
+
+    `prepared` is {row_number: (normalized, errors)} from an earlier
+    normalize pass. The preview has to normalize every row anyway to give the
+    foreign-key resolver something to group on, and without this it then threw
+    that work away and normalized all of them a second time. Optional, because
+    the single-row re-check path (PATCH /rows/{n}) has no earlier pass and
+    still needs to be able to call this on its own.
     """
     entity = get_entity(entity_key)
     fk = fk or FkResolution(groups={}, row_assignments={})
@@ -388,11 +396,18 @@ async def validate_rows(
     seen_keys: dict[str, int] = {}
 
     for row_number, raw_payload in rows:
-        normalized, errors = normalize_row(
-            entity, raw_payload, mapping,
-            date_order=date_order, value_mapping=value_mapping,
-            overrides=overrides_by_row.get(row_number),
-        )
+        ready = prepared.get(row_number) if prepared else None
+        if ready is not None:
+            # Copied, not aliased: the FK swap below rewrites `normalized` in
+            # place, and these dicts belong to the caller — the resolver is
+            # still holding the same objects.
+            normalized, errors = dict(ready[0]), list(ready[1])
+        else:
+            normalized, errors = normalize_row(
+                entity, raw_payload, mapping,
+                date_order=date_order, value_mapping=value_mapping,
+                overrides=overrides_by_row.get(row_number),
+            )
 
         if errors:
             verdicts.append(RowVerdict(

@@ -61,8 +61,13 @@ def run_migrations_online() -> None:
     and associate a connection with the context.
 
     """
+    # migration_database_url, NOT the app URL: the app runs on Supabase's
+    # transaction pooler (:6543), which hands back a different backend per
+    # transaction and cannot carry the session state DDL depends on. Alembic
+    # stays on the session pooler / direct connection.
     config.set_main_option(
-        "sqlalchemy.url", settings.DATABASE_URL.replace("+asyncpg", "").replace("%", "%%"),
+        "sqlalchemy.url",
+        settings.migration_database_url.replace("+asyncpg", "").replace("%", "%%"),
     )
 
     connectable = engine_from_config(

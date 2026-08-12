@@ -1,3 +1,4 @@
+import re
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
@@ -25,14 +26,37 @@ class Settings(BaseSettings):
     # somewhere the in-process scheduler can't. No default: unset means the
     # route refuses every request rather than running unauthenticated.
     CRON_SECRET: str | None = None
-    # Supabase's session-mode pooler caps this project at 15 concurrent
-    # clients. SQLAlchemy's DEFAULT pool (5 + 10 overflow) can therefore
-    # consume the entire quota from one process, leaving nothing for Alembic,
-    # a maintenance script, or a second worker — and once the cap is hit every
-    # request blocks forever waiting for a connection that can't arrive.
-    # These leave deliberate headroom; raise only if the Supabase plan does.
+    # ── pooling ───────────────────────────────────────────────────────────
+    # Supabase exposes the same database three ways, and which one you use
+    # decides how many clients you get:
+    #
+    #   :5432 session mode      — 15 clients for this project, one per
+    #                             connection for its whole life. This is what
+    #                             the app used, and it is why a deployed
+    #                             instance plus a local dev server plus one
+    #                             script could exhaust the quota and make
+    #                             every query hang waiting for a slot.
+    #   :6543 transaction mode  — a connection is borrowed per transaction and
+    #                             returned immediately, so the same quota
+    #                             stretches vastly further. The right fit for
+    #                             serverless, where instances are many and
+    #                             each is idle most of the time.
+    #   direct                  — needed for DDL; transaction mode cannot run
+    #                             migrations.
+    #
+    # The app runs on transaction mode; Alembic keeps the session/direct URL.
+    DB_TRANSACTION_POOLER: bool = True
+    DB_TRANSACTION_POOLER_PORT: int = 6543
+    DB_SESSION_POOLER_PORT: int = 5432
+    # Set explicitly if the migration endpoint isn't just DATABASE_URL on the
+    # session port (e.g. a true direct db.<ref>.supabase.co host).
+    MIGRATION_DATABASE_URL: str | None = None
+
+    # Transaction mode multiplexes connections, so a big per-instance pool
+    # buys nothing and starves everyone else. max_overflow=0 keeps the ceiling
+    # honest: this instance will never hold more than DB_POOL_SIZE.
     DB_POOL_SIZE: int = 5
-    DB_MAX_OVERFLOW: int = 3
+    DB_MAX_OVERFLOW: int = 0
     DB_POOL_TIMEOUT: int = 15  # fail loudly instead of hanging indefinitely
     DB_POOL_RECYCLE: int = 1800
     DB_ECHO: bool = False  # SQL logging is very noisy; opt in per environment
@@ -46,8 +70,66 @@ class Settings(BaseSettings):
     # who guesses the URL.
     LEAD_WEBHOOK_SECRET: str | None = None
 
+    # Commit batching. The importer tries a whole group in one savepoint and
+    # narrows only where it fails: 200, then 25, then bisection down to the
+    # single offending row. Set to [1] to reproduce the original per-row
+    # behaviour exactly — the differential test uses that to prove the batched
+    # path produces identical output.
+    IMPORT_CHUNK_TIER_SIZES: list[int] = [200, 25]
+
     class Config:
         env_file = ".env"
         extra = "ignore"
+
+    # ── resolved connection URLs ──────────────────────────────────────────
+
+    @staticmethod
+    def _with_port(url: str, port: int) -> str:
+        """Swap the port in a postgres URL, leaving credentials untouched."""
+        return re.sub(r"(?<=:)\d+(?=/[^/]*$)", str(port), url, count=1)
+
+    @property
+    def is_supabase_pooler(self) -> bool:
+        return "pooler.supabase.com" in self.DATABASE_URL
+
+    @property
+    def app_database_url(self) -> str:
+        """What the application connects with.
+
+        Rewritten to the transaction pooler rather than requiring the port to
+        be right in .env, because getting it wrong is invisible until the
+        pooler saturates under load and every request starts hanging.
+        """
+        if self.DB_TRANSACTION_POOLER and self.is_supabase_pooler:
+            return self._with_port(self.DATABASE_URL, self.DB_TRANSACTION_POOLER_PORT)
+        return self.DATABASE_URL
+
+    @property
+    def migration_database_url(self) -> str:
+        """What Alembic connects with — never transaction mode.
+
+        Transaction pooling hands back a different backend per transaction and
+        does not support the session state DDL relies on, so migrations must
+        use the session pooler or a direct connection.
+        """
+        if self.MIGRATION_DATABASE_URL:
+            return self.MIGRATION_DATABASE_URL
+        if self.is_supabase_pooler:
+            return self._with_port(self.DATABASE_URL, self.DB_SESSION_POOLER_PORT)
+        return self.DATABASE_URL
+
+    @property
+    def db_pool_mode(self) -> str:
+        if not self.is_supabase_pooler:
+            return "direct"
+        port = self.app_database_url.rsplit(":", 1)[-1].split("/")[0]
+        return "transaction" if port == str(self.DB_TRANSACTION_POOLER_PORT) else "session"
+
+    @property
+    def db_endpoint(self) -> str:
+        """host:port, with credentials stripped — safe to log."""
+        match = re.search(r"@([^/]+)", self.app_database_url)
+        return match.group(1) if match else "unknown"
+
 
 settings = Settings()
