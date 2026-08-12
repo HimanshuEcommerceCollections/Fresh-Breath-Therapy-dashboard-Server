@@ -135,6 +135,13 @@ class ImportBatch(Base):
     # long-running background task would be killed at the function timeout.
     commit_cursor: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
+    # Hash of everything a verdict depends on (mapping, value mapping, date
+    # order, migration mode, resolutions). While it matches, the verdicts
+    # stored on import_rows are still accurate and the preview is served from
+    # them. Nulled on any invalidating change, so a missed invalidation costs
+    # a slow preview rather than a wrong one.
+    preview_marker: Mapped[str | None] = mapped_column(String, nullable=True)
+
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     created_by: Mapped[uuid.UUID | None] = mapped_column(
