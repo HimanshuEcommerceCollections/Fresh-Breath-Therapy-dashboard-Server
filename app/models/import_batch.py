@@ -36,7 +36,11 @@ class ImportStatus(str, enum.Enum):
     PARSING = "parsing"        # file read, rows being written to import_rows
     MAPPING = "mapping"        # awaiting the admin's column-mapping approval
     PREVIEW = "preview"        # validated and resolved; awaiting final confirm
-    COMMITTING = "committing"  # chunked commit in progress
+    # Accepted, but another import of the SAME entity is writing. Recorded
+    # rather than refused: the admin's request should not be lost because
+    # someone else got there a second earlier.
+    QUEUED = "queued"
+    COMMITTING = "committing"  # writing now, inside its time limit
     COMMITTED = "committed"
     FAILED = "failed"
     ROLLED_BACK = "rolled_back"
@@ -141,6 +145,20 @@ class ImportBatch(Base):
     # them. Nulled on any invalidating change, so a missed invalidation costs
     # a slow preview rather than a wrong one.
     preview_marker: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    # When this run began writing. Distinct from updated_at, which any touch
+    # bumps and so cannot answer "has this exceeded its time limit".
+    run_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Position marker in the per-entity queue.
+    queued_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Why the previous attempt stopped. Kept apart from `error` so a timeout
+    # reads differently from a parse failure, and so the history can offer
+    # Resume with a reason attached.
+    last_failure: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 

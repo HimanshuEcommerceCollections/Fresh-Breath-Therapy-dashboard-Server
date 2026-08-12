@@ -216,6 +216,12 @@ class ImportPreview(BaseModel):
 
 
 class CommitResult(BaseModel):
+    # Set when another import of the SAME entity is writing. The request was
+    # accepted and recorded, not refused — the client keeps polling and this
+    # batch starts by itself when the entity frees up.
+    queued: bool = False
+    queue_position: int = 0
+    queued_behind: str | None = None
     processed: int
     created: int
     updated: int
