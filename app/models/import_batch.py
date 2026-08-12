@@ -146,6 +146,12 @@ class ImportBatch(Base):
     committed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Heartbeat for the single-active-import lock. Every commit chunk advances
+    # commit_cursor, which bumps this — so a running import keeps proving it's
+    # alive, and one abandoned mid-way goes quiet and stops blocking others.
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
     rows: Mapped[list["ImportRow"]] = relationship(
         back_populates="batch", cascade="all, delete-orphan"

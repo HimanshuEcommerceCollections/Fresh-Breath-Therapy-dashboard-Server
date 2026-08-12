@@ -3,7 +3,7 @@ load_dotenv()
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
-from app.database import AsyncSessionLocal
+from app.database import AsyncSessionLocal, log_connection_mode
 from app.startup import ensure_auth_bootstrap
 from app.routers import (
     auth, locations, therapists, leads, clients, follow_up,
@@ -53,6 +53,10 @@ app.include_router(imports.router)
 @app.on_event("startup")
 async def _start_scheduler():
     start_scheduler()
+
+@app.on_event("startup")
+async def _log_db_mode():
+    log_connection_mode()
 
 @app.on_event("startup")
 async def on_startup():

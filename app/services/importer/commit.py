@@ -25,20 +25,25 @@ from __future__ import annotations
 import logging
 import re
 import uuid
-from dataclasses import dataclass
-from datetime import date, datetime, time, timezone
+from dataclasses import dataclass, field
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 
 from sqlalchemy import (
-    Boolean, Date, DateTime, Integer, Numeric, Time, func, select, text,
+    Boolean, Date, DateTime, Integer, Numeric, Time, bindparam, func,
+    select, text, tuple_, update,
 )
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.models.enrollment import Enrollment
 from app.models.enums import EnrollmentStatus
 from app.models.import_batch import ImportBatch, ImportRow, ImportRowStatus, ImportStatus
+from app.models.location import Location
 from app.models.package import Package
 from app.models.payment import Payment
+from app.services.ids import uuid7
 from app.services.importer.registry import FieldKind, Writability, get_entity
 from app.services.importer.resolver import ensure_location
 from app.services.importer.validator import model_attr
@@ -49,6 +54,20 @@ logger = logging.getLogger(__name__)
 # when every row triggers an enrollment lock, large enough that a few thousand
 # rows is a handful of calls rather than hundreds.
 CHUNK_SIZE = 200
+
+# How long a claimed-but-silent import keeps blocking others. Comfortably
+# longer than any single chunk (each is bounded to stay inside a serverless
+# timeout), short enough that an abandoned import isn't an all-day outage.
+STALE_CLAIM_AFTER = timedelta(minutes=5)
+
+
+def _tier_sizes() -> list[int]:
+    """Group sizes to try, largest first; bisect below the last.
+
+    `[1]` reproduces the original per-row behaviour exactly, which is what the
+    differential test uses to generate its reference output.
+    """
+    return list(settings.IMPORT_CHUNK_TIER_SIZES or [CHUNK_SIZE, 25])
 
 PENDING = (ImportRowStatus.CREATE.value, ImportRowStatus.UPDATE.value)
 
@@ -61,6 +80,32 @@ class CommitProgress:
     failed: int
     remaining: int
     done: bool
+
+
+async def find_running_import(
+    db: AsyncSession, *, other_than: uuid.UUID | None = None
+) -> ImportBatch | None:
+    """The batch currently being written, if any.
+
+    Imports are deliberately serialised. Two running at once can interleave
+    in ways neither preview predicted: both were validated against the
+    database as it stood BEFORE either started, so the second one's duplicate
+    checks, its "is there already an active enrollment" guard and its running
+    payment balances are all reasoning about a state that the first is busy
+    changing underneath it. Refusing the second is the only cheap way to keep
+    every verdict the admin approved actually true at the moment it is applied.
+    """
+    query = select(ImportBatch).where(
+        ImportBatch.status == ImportStatus.COMMITTING.value,
+        # Self-releasing. An admin who closes the tab mid-import would
+        # otherwise leave the batch claimed forever and every future import
+        # blocked, with no way to clear it. Each chunk bumps updated_at, so a
+        # live import keeps renewing its claim and an abandoned one lapses.
+        ImportBatch.updated_at > datetime.now(timezone.utc) - STALE_CLAIM_AFTER,
+    )
+    if other_than is not None:
+        query = query.where(ImportBatch.id != other_than)
+    return (await db.execute(query.limit(1))).scalar_one_or_none()
 
 
 def external_ref_for(batch_id: uuid.UUID, row_number: int) -> str:
@@ -309,10 +354,424 @@ async def _create_enrollment(db: AsyncSession, values: dict, ref: str) -> Enroll
     return enrollment
 
 
+@dataclass
+class _Ctx:
+    """Everything the group appliers need, resolved once per chunk."""
+    entity: object
+    ref_field: str
+    has_ref: bool
+    created_by: uuid.UUID | None
+    # name(lowercased) -> id, for auto-created locations. Filled per group so
+    # 200 rows naming the same six clinics cost one SELECT and one INSERT
+    # rather than 400 round trips.
+    locations: dict[str, uuid.UUID] = field(default_factory=dict)
+
+
+@dataclass
+class _Outcome:
+    entity_id: uuid.UUID | None = None
+    error: str | None = None
+
+
+async def _prepare_locations(db: AsyncSession, ctx: _Ctx, rows) -> None:
+    """Resolve every auto-create FK name in this group in two statements.
+
+    This is where the gap between the documented 3 round trips per row and the
+    measured 5.5 came from: each therapist row separately looked up, and
+    sometimes created, its clinic.
+    """
+    specs = [
+        s for s in ctx.entity.fields
+        if s.kind is FieldKind.FK and s.fk_auto_create
+    ]
+    if not specs:
+        return
+
+    wanted: set[str] = set()
+    for row in rows:
+        values = row.normalized_payload or {}
+        for spec in specs:
+            value = values.get(spec.name)
+            if not value:
+                continue
+            try:
+                uuid.UUID(str(value))
+            except (ValueError, TypeError, AttributeError):
+                wanted.add(str(value).strip())
+
+    wanted = {w for w in wanted if w and w.lower() not in ctx.locations}
+    if not wanted:
+        return
+
+    found = await db.execute(
+        select(Location.id, Location.name).where(
+            func.lower(Location.name).in_([w.lower() for w in wanted])
+        )
+    )
+    for location_id, name in found.all():
+        ctx.locations[name.strip().lower()] = location_id
+
+    missing = [w for w in wanted if w.lower() not in ctx.locations]
+    if missing:
+        new_rows = [{"id": uuid7(), "name": name} for name in missing]
+        await db.execute(insert(Location), new_rows)
+        for entry in new_rows:
+            ctx.locations[entry["name"].strip().lower()] = entry["id"]
+
+
+def _apply_location_map(ctx: _Ctx, values: dict) -> None:
+    for spec in ctx.entity.fields:
+        if spec.kind is not FieldKind.FK or not spec.fk_auto_create:
+            continue
+        value = values.get(spec.name)
+        if not value:
+            continue
+        try:
+            uuid.UUID(str(value))
+        except (ValueError, TypeError, AttributeError):
+            resolved = ctx.locations.get(str(value).strip().lower())
+            if resolved is not None:
+                values[spec.name] = str(resolved)
+
+
+async def _apply_group(
+    db: AsyncSession, ctx: _Ctx, batch: ImportBatch, rows: list[ImportRow]
+) -> dict[uuid.UUID, _Outcome]:
+    """Write a whole group with one statement per table, per operation.
+
+    Raises on the first problem — the caller's tiering decides how finely to
+    retry. Nothing here inspects individual rows for validity; the preview
+    already did that, so the clean path is expected to dominate.
+    """
+    outcomes: dict[uuid.UUID, _Outcome] = {}
+    await _prepare_locations(db, ctx, rows)
+
+    creates = [r for r in rows if r.status == ImportRowStatus.CREATE.value]
+    updates = [r for r in rows if r.status == ImportRowStatus.UPDATE.value]
+
+    if creates:
+        if ctx.entity.key == "payments":
+            outcomes.update(await _insert_payments(db, ctx, batch, creates))
+        else:
+            outcomes.update(await _insert_records(db, ctx, batch, creates))
+
+    for row in updates:
+        outcomes[row.id] = _Outcome(entity_id=row.entity_id)
+    if updates:
+        await _apply_updates(db, ctx, batch, updates)
+
+    return outcomes
+
+
+def _bind_chunks(rows: list[dict], columns: int) -> list[list[dict]]:
+    """Split so no statement exceeds Postgres' 65,535 bind parameters."""
+    per = max(1, 60000 // max(columns, 1))
+    return [rows[i:i + per] for i in range(0, len(rows), per)]
+
+
+async def _insert_records(
+    db: AsyncSession, ctx: _Ctx, batch: ImportBatch, rows: list[ImportRow]
+) -> dict[uuid.UUID, _Outcome]:
+    """One batched INSERT per table for everything except payments.
+
+    Plain insert, deliberately NOT on_conflict_do_nothing: a conflict here
+    means something the preview didn't foresee, and silently swallowing it
+    would report the row as created when nothing was written. Letting it raise
+    hands the row to the tiering, which isolates it and records the same
+    message the row-by-row path produced.
+    """
+    payloads: list[dict] = []
+    order: list[ImportRow] = []
+
+    for row in rows:
+        values = dict(row.normalized_payload or {})
+        _apply_location_map(ctx, values)
+        ref = values.get(ctx.ref_field) or external_ref_for(batch.id, row.row_number)
+
+        if ctx.entity.key == "enrollments":
+            payload = _enrollment_payload(values, ref)
+        else:
+            payload = _model_kwargs(ctx.entity, values)
+            if ctx.has_ref:
+                payload.setdefault(ctx.ref_field, ref)
+        payload["id"] = uuid7()
+        payloads.append(payload)
+        order.append(row)
+
+    # Every dict handed to executemany must have identical keys, or SQLAlchemy
+    # cannot compile one statement for the batch.
+    keys: set[str] = set()
+    for payload in payloads:
+        keys.update(payload)
+    for payload in payloads:
+        for key in keys:
+            payload.setdefault(key, None)
+
+    for group in _bind_chunks(payloads, len(keys)):
+        await db.execute(insert(ctx.entity.model), group)
+
+    return {row.id: _Outcome(entity_id=payload["id"])
+            for row, payload in zip(order, payloads)}
+
+
+def _enrollment_payload(values: dict, ref: str) -> dict:
+    price = Decimal(str(values["package_price_snapshot"]))
+    payload = {
+        "external_ref": ref,
+        "client_id": uuid.UUID(values["client"]),
+        "package_id": uuid.UUID(values["package"]),
+        "package_price_snapshot": price,
+        "total_paid": Decimal("0"),
+        "amount_due": price,
+        "status": EnrollmentStatus.ACTIVE,
+        "is_overdue": bool(values.get("is_overdue") or False),
+    }
+    for name in ("started_at", "completed_at"):
+        if values.get(name):
+            payload[name] = _coerce(Enrollment, name, values[name])
+    return payload
+
+
+async def _apply_updates(
+    db: AsyncSession, ctx: _Ctx, batch: ImportBatch, rows: list[ImportRow]
+) -> None:
+    """One batched UPDATE per table, keyed on primary key."""
+    payloads: list[dict] = []
+    for row in rows:
+        if row.entity_id is None:
+            raise ValueError("The record this row updates no longer exists")
+        values = dict(row.normalized_payload or {})
+        _apply_location_map(ctx, values)
+        payload: dict = {"_pk": row.entity_id}
+        for field_name in ((row.diff or {}).get("changes") or {}):
+            spec = ctx.entity.field(field_name)
+            if spec is None or spec.writable is Writability.NEVER:
+                continue
+            value = values.get(field_name)
+            payload[model_attr(field_name, spec.kind)] = (
+                uuid.UUID(value) if (spec.kind is FieldKind.FK and value)
+                else _coerce(ctx.entity.model, field_name, value)
+            )
+        if ctx.has_ref:
+            payload.setdefault(
+                ctx.ref_field,
+                values.get(ctx.ref_field)
+                or external_ref_for(batch.id, row.row_number),
+            )
+        payloads.append(payload)
+
+    keys: set[str] = set()
+    for payload in payloads:
+        keys.update(payload)
+    keys.discard("_pk")
+    for payload in payloads:
+        for key in keys:
+            payload.setdefault(key, None)
+
+    if not keys:
+        return
+    statement = (
+        update(ctx.entity.model)
+        .where(ctx.entity.model.id == bindparam("_pk"))
+    )
+    for group in _bind_chunks(payloads, len(keys) + 1):
+        await db.execute(statement, group)
+
+
+async def _apply_tiered(
+    db: AsyncSession,
+    ctx: _Ctx,
+    batch: ImportBatch,
+    rows: list[ImportRow],
+    outcomes: dict[uuid.UUID, _Outcome],
+    *,
+    tier: int,
+) -> None:
+    """Try the whole set in one savepoint; narrow only where it fails.
+
+    Per-row savepoints gave perfect isolation at the cost of three round trips
+    per row. This keeps the isolation and pays for it only when something
+    actually goes wrong:
+
+        whole chunk (200)  -> one savepoint, ~5 round trips if clean
+          on failure, groups of 25
+            on failure, bisect                (~log2(25) ≈ 5 attempts)
+              single row -> record the failure
+
+    The preview has already validated every row against the database, so the
+    clean path is the overwhelmingly common one. A group that fails costs its
+    own retry, which is why the tiers narrow geometrically rather than
+    dropping straight to one row at a time — isolating one bad row out of 25
+    linearly would cost more than the batching saved.
+    """
+    if not rows:
+        return
+
+    savepoint = await db.begin_nested()
+    try:
+        result = await _apply_group(db, ctx, batch, rows)
+        await savepoint.commit()
+        outcomes.update(result)
+        return
+    except Exception as exc:
+        await savepoint.rollback()
+        if len(rows) == 1:
+            logger.exception("Import row %s failed", rows[0].row_number)
+            # Same humanised text the row-by-row path produced.
+            outcomes[rows[0].id] = _Outcome(error=humanize(exc))
+            return
+        logger.info(
+            "Import batch %s: group of %d failed, narrowing (%s)",
+            batch.id, len(rows), exc.__class__.__name__,
+        )
+
+    tiers = _tier_sizes()
+    next_tier = tier + 1
+    if next_tier < len(tiers):
+        size = max(1, tiers[next_tier])
+        parts = [rows[i:i + size] for i in range(0, len(rows), size)]
+        # A group already at or below the next tier's size would recurse
+        # forever; bisect it instead.
+        if len(parts) == 1:
+            middle = len(rows) // 2
+            parts = [rows[:middle], rows[middle:]]
+    else:
+        middle = len(rows) // 2
+        parts = [rows[:middle], rows[middle:]]
+
+    for part in parts:
+        await _apply_tiered(db, ctx, batch, part, outcomes, tier=next_tier)
+
+
+async def _insert_payments(
+    db: AsyncSession, ctx: _Ctx, batch: ImportBatch, rows: list[ImportRow]
+) -> dict[uuid.UUID, _Outcome]:
+    """Payments, batched without breaking the running balance.
+
+    The ledger rule is unchanged: every payment's balance_after is the
+    enrollment's amount_due immediately after that payment is applied, with
+    payments applied in DATE order. Batching only changes where the arithmetic
+    happens — in memory over the whole group instead of one round trip per
+    payment — never what it produces.
+
+    Locks are taken once per distinct enrollment for the whole group, and in a
+    consistently sorted order, so a large import can't deadlock against a
+    clinician recording a payment in the dashboard at the same moment.
+    """
+    by_pair: dict[tuple[uuid.UUID, uuid.UUID], list[ImportRow]] = {}
+    for row in rows:
+        values = row.normalized_payload or {}
+        key = (uuid.UUID(values["client"]), uuid.UUID(values["package"]))
+        by_pair.setdefault(key, []).append(row)
+
+    # One SELECT for every enrollment this group touches. Sorted by id so the
+    # lock order is deterministic across concurrent writers.
+    pairs = sorted(by_pair)
+    existing = (await db.execute(
+        select(Enrollment)
+        .where(
+            tuple_(Enrollment.client_id, Enrollment.package_id).in_(pairs),
+            Enrollment.status == EnrollmentStatus.ACTIVE,
+        )
+        .order_by(Enrollment.id)
+        .with_for_update()
+    )).scalars().all()
+    enrollments = {(e.client_id, e.package_id): e for e in existing}
+
+    # Pairs with no open cycle need one. Falls back to the package's current
+    # price, which is why enrollments are meant to be imported first.
+    missing = [p for p in pairs if p not in enrollments]
+    if missing:
+        prices = dict((await db.execute(
+            select(Package.id, Package.price)
+            .where(Package.id.in_({package_id for _, package_id in missing}))
+        )).all())
+        fresh = []
+        for client_id, package_id in missing:
+            price = prices.get(package_id)
+            if price is None:
+                raise ValueError("Package no longer exists")
+            new = Enrollment(
+                id=uuid7(), client_id=client_id, package_id=package_id,
+                package_price_snapshot=price, total_paid=Decimal("0"),
+                amount_due=price, status=EnrollmentStatus.ACTIVE,
+            )
+            fresh.append(new)
+            enrollments[(client_id, package_id)] = new
+        db.add_all(fresh)
+        await db.flush()
+
+    payments: list[dict] = []
+    outcomes: dict[uuid.UUID, _Outcome] = {}
+
+    for pair in pairs:
+        enrollment = enrollments[pair]
+        paid = Decimal(str(enrollment.total_paid or 0))
+        price = Decimal(str(enrollment.package_price_snapshot or 0))
+
+        # Date order within the enrollment, exactly as the row-by-row path
+        # received them (see _pending_query). Row number breaks ties so the
+        # sequence is deterministic for two payments on the same day.
+        ordered = sorted(
+            by_pair[pair],
+            key=lambda r: (str((r.normalized_payload or {}).get("date") or ""),
+                           r.row_number),
+        )
+
+        for row in ordered:
+            values = dict(row.normalized_payload or {})
+            amount = Decimal(str(values["amount_paid"]))
+            paid += amount
+            remaining = price - paid
+            due = remaining if remaining > 0 else Decimal("0")
+
+            payment_id = uuid7()
+            payments.append({
+                "id": payment_id,
+                "external_ref": values.get(ctx.ref_field)
+                or external_ref_for(batch.id, row.row_number),
+                "enrollment_id": enrollment.id,
+                "client_id": pair[0],
+                "package_id": pair[1],
+                "amount_paid": amount,
+                "balance_after": due,
+                "method": values["method"],
+                "date": _coerce(Payment, "date", values["date"]),
+                "created_by": ctx.created_by,
+            })
+            outcomes[row.id] = _Outcome(entity_id=payment_id)
+
+        # The enrollment's totals move once, to where the whole chain landed.
+        enrollment.total_paid = paid
+        enrollment.amount_due = price - paid if price - paid > 0 else Decimal("0")
+        if paid >= price:
+            enrollment.status = EnrollmentStatus.COMPLETED
+            enrollment.completed_at = datetime.now(timezone.utc)
+            enrollment.is_overdue = False
+
+    for group in _bind_chunks(payments, 10):
+        await db.execute(insert(Payment), group)
+    await db.flush()
+    return outcomes
+
+
 async def commit_chunk(
     db: AsyncSession, batch: ImportBatch, *, limit: int = CHUNK_SIZE
 ) -> CommitProgress:
     """Write one bounded slice. Call until `done`."""
+    # Claim the batch BEFORE touching a single row, in its own committed
+    # transaction so every other request sees it immediately.
+    #
+    # Previously this was set at the END of a chunk, which meant an import of
+    # 200 rows or fewer never reported "committing" at all: the whole run
+    # happened while the batch still said "preview", so the history listed it
+    # as awaiting review and offered a Resume button for a batch actively
+    # being written. It is also what makes the single-active-import check
+    # possible — a claim nobody can see protects nothing.
+    if batch.status != ImportStatus.COMMITTING.value:
+        batch.status = ImportStatus.COMMITTING.value
+        await db.commit()
+
     entity = get_entity(batch.entity)
     ref_field = "external_id" if entity.key == "leads" else "external_ref"
     # Not every table has one. Locations are identified by name — which IS
@@ -326,68 +785,24 @@ async def commit_chunk(
 
     created = updated = failed = 0
 
+    ctx = _Ctx(
+        entity=entity, ref_field=ref_field, has_ref=has_ref,
+        created_by=batch.created_by,
+    )
+    outcomes: dict[uuid.UUID, _Outcome] = {}
+    await _apply_tiered(db, ctx, batch, rows, outcomes, tier=0)
+
+    # Statuses are written OUTSIDE every savepoint: anything set inside one
+    # that later rolls back is discarded, and a row's verdict has to survive
+    # its own failure.
     for row in rows:
-        values = dict(row.normalized_payload or {})
-        ref = values.get(ref_field) or external_ref_for(batch.id, row.row_number)
-        was_create = row.status == ImportRowStatus.CREATE.value
-        new_entity_id = None
-        error: str | None = None
-
-        try:
-            # A SAVEPOINT per row. One bad row must not abandon the other 199,
-            # and without this a failed flush leaves the session unusable for
-            # everything after it.
-            async with db.begin_nested():
-                await _resolve_auto_create_fks(db, entity, values)
-
-                if was_create:
-                    if entity.key == "payments":
-                        obj = await _create_payment(db, values, ref, batch.created_by)
-                    elif entity.key == "enrollments":
-                        obj = await _create_enrollment(db, values, ref)
-                    else:
-                        kwargs = _model_kwargs(entity, values)
-                        if has_ref:
-                            kwargs.setdefault(ref_field, ref)
-                        obj = entity.model(id=uuid.uuid4(), **kwargs)
-                        db.add(obj)
-                    await db.flush()
-                    new_entity_id = obj.id
-                else:
-                    existing = await db.get(entity.model, row.entity_id)
-                    if existing is None:
-                        raise ValueError(
-                            "The record this row updates no longer exists"
-                        )
-                    changes = (row.diff or {}).get("changes") or {}
-                    for field_name in changes:
-                        spec = entity.field(field_name)
-                        if spec is None or spec.writable is Writability.NEVER:
-                            continue
-                        value = values.get(field_name)
-                        setattr(
-                            existing,
-                            model_attr(field_name, spec.kind),
-                            uuid.UUID(value)
-                            if (spec.kind is FieldKind.FK and value) else value,
-                        )
-                    if has_ref and getattr(existing, ref_field, None) is None:
-                        setattr(existing, ref_field, ref)
-                    await db.flush()
-        except Exception as exc:
-            logger.exception("Import row %s failed", row.row_number)
-            # Full detail goes to the log; the row keeps a sentence the admin
-            # can act on rather than a SQLAlchemy dump of the INSERT.
-            error = humanize(exc)
-
-        # Set outside the savepoint: anything written inside a rolled-back one
-        # is discarded, and the row's verdict has to survive the failure.
-        if error:
+        outcome = outcomes.get(row.id) or _Outcome(error="Row was not attempted")
+        if outcome.error:
             row.status = ImportRowStatus.FAILED.value
-            row.errors = [{"field": None, "column": None, "message": error}]
+            row.errors = [{"field": None, "column": None, "message": outcome.error}]
             failed += 1
-        elif was_create:
-            row.entity_id = new_entity_id
+        elif row.status == ImportRowStatus.CREATE.value:
+            row.entity_id = outcome.entity_id
             row.status = ImportRowStatus.CREATED.value
             created += 1
         else:

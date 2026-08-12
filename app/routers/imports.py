@@ -738,13 +738,18 @@ async def preview_import(
     # Row numbers travel with the values: the resolver groups by name AND by
     # the row's own context (a client's location), so it needs to know which
     # rows fed which group.
+    # Normalized ONCE and reused. The resolver needs the values to group on,
+    # and validate_rows needs the same values plus their errors — deriving
+    # them twice was pure duplicated work over every row in the sheet.
+    prepared: dict[int, tuple[dict, list[dict]]] = {}
     normalized_preview = []
     for row_number, payload in raw_rows:
-        values, _ = validator.normalize_row(
+        values, errors = validator.normalize_row(
             get_entity(batch.entity), payload, batch.column_mapping or {},
             date_order=batch.date_order, value_mapping=batch.value_mapping,
             overrides=overrides.get(row_number),
         )
+        prepared[row_number] = (values, errors)
         normalized_preview.append((row_number, values))
 
     fk = await resolver.resolve_foreign_keys(
@@ -761,6 +766,7 @@ async def preview_import(
         fk=fk,
         migration_mode=batch.migration_mode,
         overrides_by_row=overrides,
+        prepared=prepared,
     )
 
     # Persist the verdicts — this is what commit_chunk later reads.
@@ -876,6 +882,24 @@ async def commit_import(
         raise HTTPException(
             status_code=409,
             detail="Review the preview before committing this import.",
+        )
+
+    # One import at a time, across every admin and every browser tab.
+    #
+    # Both imports were validated against the database as it stood before
+    # either began, so running them together means the second one's duplicate
+    # checks, enrollment-cycle guard and payment balances are all reasoning
+    # about a state the first is actively changing. Serialising is what keeps
+    # the verdicts the admin approved true at the moment they're applied.
+    running = await commit_service.find_running_import(db, other_than=batch.id)
+    if running is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f'"{running.filename}" is being imported right now. Wait for it '
+                "to finish, then start this one — running two at once could "
+                "produce duplicates neither preview predicted."
+            ),
         )
 
     # Re-check the blockers server-side. The UI disables the button, but the
