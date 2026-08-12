@@ -60,6 +60,11 @@ CHUNK_SIZE = 200
 # timeout), short enough that an abandoned import isn't an all-day outage.
 STALE_CLAIM_AFTER = timedelta(minutes=5)
 
+# Arbitrary but fixed: every import commit contends for this one advisory
+# lock, so two can never write concurrently even if both somehow passed the
+# `committing` status check.
+_ADVISORY_LOCK_KEY = 0x1_50_1_1_0_0_7  # "IMPORT" in a shape that fits a bigint
+
 
 def _tier_sizes() -> list[int]:
     """Group sizes to try, largest first; bisect below the last.
@@ -771,6 +776,26 @@ async def commit_chunk(
     if batch.status != ImportStatus.COMMITTING.value:
         batch.status = ImportStatus.COMMITTING.value
         await db.commit()
+
+    # Fail loudly rather than holding locks. A commit that wedges — a lock
+    # held by a dashboard write, a pathological query — would otherwise sit
+    # there with the batch claimed and every other import blocked behind it.
+    # SET LOCAL, so both die with this transaction and never leak into a
+    # pooled connection someone else picks up next.
+    await db.execute(text("SET LOCAL statement_timeout = '60s'"))
+    await db.execute(text("SET LOCAL lock_timeout = '3s'"))
+
+    # Second line of defence behind the `committing` status. Transaction-scoped
+    # deliberately: pg_advisory_lock needs session affinity, which a
+    # transaction pooler cannot promise — the lock would be taken on one
+    # backend and the release attempted on another.
+    claimed = await db.scalar(
+        select(func.pg_try_advisory_xact_lock(_ADVISORY_LOCK_KEY))
+    )
+    if not claimed:
+        raise RuntimeError(
+            "Another import is writing right now. Wait for it to finish."
+        )
 
     entity = get_entity(batch.entity)
     ref_field = "external_id" if entity.key == "leads" else "external_ref"

@@ -27,7 +27,7 @@ import httpx
 from fastapi import (
     APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status,
 )
-from sqlalchemy import func, select
+from sqlalchemy import bindparam, func, select, update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -658,17 +658,7 @@ async def _revalidate_rows(
         prepared=prepared,
     )
 
-    by_number = {v.row_number: v for v in verdicts}
-    for row in stored:
-        verdict = by_number.get(row.row_number)
-        if verdict is None:
-            continue
-        row.status = verdict.status
-        row.normalized_payload = verdict.normalized
-        row.source_hash = verdict.source_hash
-        row.errors = verdict.errors or None
-        row.diff = verdict.diff
-        row.entity_id = uuid.UUID(verdict.entity_id) if verdict.entity_id else None
+    await _write_verdicts(db, batch, verdicts)
 
     # A scoped re-check changes this batch's counts, so the preview cached
     # against the old marker is no longer accurate.
@@ -682,6 +672,36 @@ async def _revalidate_rows(
         )
         for v in verdicts
     ]
+
+
+async def _write_verdicts(db: AsyncSession, batch: ImportBatch, verdicts) -> None:
+    """Write every verdict in one statement per parameter-limit chunk."""
+    if not verdicts:
+        return
+    payloads = [
+        {
+            "_batch": batch.id,
+            "_row": v.row_number,
+            "status": v.status,
+            "normalized_payload": v.normalized,
+            "source_hash": v.source_hash,
+            "errors": v.errors or None,
+            "diff": v.diff,
+            "entity_id": uuid.UUID(v.entity_id) if v.entity_id else None,
+        }
+        for v in verdicts
+    ]
+    statement = (
+        sa_update(ImportRow)
+        .where(
+            ImportRow.batch_id == bindparam("_batch"),
+            ImportRow.row_number == bindparam("_row"),
+        )
+    )
+    # 8 bound parameters per row; stay well under Postgres' 65,535 ceiling.
+    per_statement = 60000 // 8
+    for i in range(0, len(payloads), per_statement):
+        await db.execute(statement, payloads[i:i + per_statement])
 
 
 async def _preview_from_stored(
@@ -1012,20 +1032,13 @@ async def preview_import(
     )
 
     # Persist the verdicts — this is what commit_chunk later reads.
-    by_number = {v.row_number: v for v in verdicts}
-    result = await db.execute(
-        select(ImportRow).where(ImportRow.batch_id == batch.id)
-    )
-    for row in result.scalars().all():
-        verdict = by_number.get(row.row_number)
-        if verdict is None:
-            continue
-        row.status = verdict.status
-        row.normalized_payload = verdict.normalized
-        row.source_hash = verdict.source_hash
-        row.errors = verdict.errors or None
-        row.diff = verdict.diff
-        row.entity_id = uuid.UUID(verdict.entity_id) if verdict.entity_id else None
+    #
+    # One batched UPDATE keyed on (batch_id, row_number) rather than loading
+    # every ImportRow as an ORM object and assigning field by field. Note this
+    # is code quality, not speed: SQLAlchemy already pipelined those per-row
+    # updates into one round trip, which is why persisting 150 verdicts cost
+    # ~1.8s rather than the ~75s that 150 sequential round trips would.
+    await _write_verdicts(db, batch, verdicts)
 
     batch.preview_marker = marker
     counts = validator.summarize(verdicts)
