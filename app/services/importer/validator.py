@@ -231,9 +231,61 @@ def natural_key(entity: EntitySpec, values: dict) -> str | None:
     return "|".join(parts)
 
 
+
+def _index_bounds(
+    entity: EntitySpec,
+    rows: list[tuple[int, dict]],
+    prepared: dict[int, tuple[dict, list[dict]]] | None,
+    fk: FkResolution,
+) -> dict[str, set[str]] | None:
+    """Values to bound the existing-record read by, per natural-key column.
+
+    Foreign-key components are taken from the RESOLUTION, not from the
+    normalized row: at this stage the row still holds the name the sheet used,
+    and only `fk.row_assignments` knows which record it points at. Text
+    components come from the normalized values.
+
+    Returns None when there is nothing usable, which reads the whole table —
+    correct, just unbounded. Better a slow read than a wrong one.
+    """
+    if not prepared:
+        return None
+
+    ref_name = "external_id" if entity.key == "leads" else "external_ref"
+    bounds: dict[str, set[str]] = {}
+
+    for name in entity.natural_key:
+        spec = entity.field(name)
+        if spec is None:
+            continue
+        values: set[str] = set()
+        if spec.kind is FieldKind.FK:
+            for row_number, _ in rows:
+                assigned = fk.row_assignments.get((name, row_number))
+                if assigned and assigned != FkResolution.WILL_CREATE:
+                    values.add(str(assigned))
+        elif spec.kind in (FieldKind.TEXT, FieldKind.EMAIL):
+            for normalized, _ in prepared.values():
+                value = normalized.get(name)
+                if value not in (None, ""):
+                    values.add(_key_part(value))
+        if values:
+            bounds[name] = values
+
+    refs = {
+        str(normalized.get(ref_name))
+        for normalized, _ in prepared.values()
+        if normalized.get(ref_name)
+    }
+    if refs and entity.model.__table__.columns.get(ref_name) is not None:
+        bounds[ref_name] = refs
+
+    return bounds or None
+
+
 async def load_existing_index(
     db: AsyncSession, entity: EntitySpec,
-    normalized_rows: list[dict] | None = None,
+    bounds: dict[str, set[str]] | None = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
     """(by_external_ref, by_natural_key) over every existing row.
 
@@ -256,38 +308,49 @@ async def load_existing_index(
     # (payments) are left unconstrained rather than risk a type mismatch
     # silently excluding a row that should have matched — being a looser
     # superset costs bandwidth, being a subset would cost correctness.
-    if normalized_rows:
+    # Bound the read by the sheet where we safely can.
+    #
+    # `bounds` is {field_name: {already-comparable values}} built by the
+    # caller, which is the only place that knows how to make an FK value
+    # comparable: at this point a natural-key FK is still the NAME from the
+    # sheet, and the name->id swap does not happen until the per-row loop
+    # below. Resolving it here by calling uuid.UUID() on a name is exactly the
+    # bug the full-output differential caught — it crashed every entity whose
+    # natural key contains a foreign key (enrollments, payments, sessions)
+    # while leaving the text-keyed entities working, so nothing noticed.
+    #
+    # The natural key is a COMPOSITE, and reconstructing it in SQL differs per
+    # entity, so these conditions are OR'd per column: a superset of the rows
+    # that could match. A superset is the point — the composite keys are still
+    # built in Python exactly as before, so no verdict can change, while the
+    # rows crossing the wire shrink to the size of the import.
+    if bounds:
         conditions = []
-        for name in entity.natural_key:
+        for name, values in bounds.items():
+            if not values:
+                continue
             spec = entity.field(name)
-            if spec is None or spec.kind not in (
-                FieldKind.TEXT, FieldKind.EMAIL, FieldKind.FK
-            ):
+            if spec is None:
+                # The reference column, which is not a registry field.
+                column = entity.model.__table__.columns.get(name)
+                if column is not None:
+                    conditions.append(column.in_(values))
                 continue
             column = entity.model.__table__.columns.get(
                 model_attr(name, spec.kind)
             )
             if column is None:
                 continue
-            values = {
-                _key_part(v.get(name)) for v in normalized_rows
-                if v.get(name) not in (None, "")
-            }
-            if not values:
-                continue
             if spec.kind is FieldKind.FK:
-                conditions.append(column.in_([uuid.UUID(v) for v in values]))
-            else:
+                # Already resolved ids, supplied by the caller.
+                try:
+                    conditions.append(column.in_([uuid.UUID(v) for v in values]))
+                except (ValueError, AttributeError, TypeError):
+                    # An unresolved value means this column cannot narrow the
+                    # read. Skipping it widens the superset; it never shrinks it.
+                    continue
+            elif spec.kind in (FieldKind.TEXT, FieldKind.EMAIL):
                 conditions.append(func.lower(column).in_(values))
-
-        ref_name = "external_id" if entity.key == "leads" else "external_ref"
-        ref_col = entity.model.__table__.columns.get(ref_name)
-        if ref_col is not None:
-            refs = {
-                str(v.get(ref_name)) for v in normalized_rows if v.get(ref_name)
-            }
-            if refs:
-                conditions.append(ref_col.in_(refs))
 
         if conditions:
             query = query.where(or_(*conditions))
@@ -431,10 +494,8 @@ async def validate_rows(
     entity = get_entity(entity_key)
     fk = fk or FkResolution(groups={}, row_assignments={})
     overrides_by_row = overrides_by_row or {}
-    # Bounded by the sheet only when the normalized values are in hand;
-    # the standalone path has none and falls back to the full read.
     by_ref, by_key = await load_existing_index(
-        db, entity, [v[0] for v in prepared.values()] if prepared else None
+        db, entity, _index_bounds(entity, rows, prepared, fk)
     )
     ref_field = "external_id" if entity.key == "leads" else "external_ref"
     # Only enrollments have a one-active-cycle rule; None everywhere else
