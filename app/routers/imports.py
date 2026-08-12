@@ -16,6 +16,8 @@ happen — per row, with her own spreadsheet line numbers — and approve it.
 Admin-only throughout. This writes patient records in bulk; Coordinator can
 read the dashboard but must not be able to reshape it from a file.
 """
+import hashlib
+import json
 import logging
 import re
 import uuid
@@ -239,6 +241,22 @@ def _fk_group_out(group) -> FkGroupOut:
         rows=[FkRowRefOut(row_number=r.row_number, label=r.label) for r in group.rows],
         message=group.message,
     )
+
+
+def _preview_marker(batch: ImportBatch) -> str:
+    """Fingerprint of every input a verdict depends on.
+
+    Deliberately excludes the raw rows: they are immutable once uploaded, so
+    anything that can change a verdict is in here.
+    """
+    payload = json.dumps({
+        "mapping": batch.column_mapping or {},
+        "values": batch.value_mapping or {},
+        "date_order": batch.date_order,
+        "migration": batch.migration_mode,
+        "resolutions": batch.fk_resolutions or {},
+    }, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def _saved_group_decisions(batch: ImportBatch) -> dict[str, str]:
@@ -511,6 +529,10 @@ async def update_mapping(
         batch.migration_mode = payload.migration_mode
 
     batch.status = ImportStatus.MAPPING.value
+    # A mapping, value-mapping, date-order or migration-mode change genuinely
+    # invalidates every verdict in the sheet — unlike answering one name, this
+    # one keeps its full re-run.
+    batch.preview_marker = None
     await db.commit()
 
     return await _batch_detail(db, batch)
@@ -539,11 +561,221 @@ async def update_resolutions(
         rows.setdefault(field_name, {}).update(answers)
 
     batch.fk_resolutions = {"groups": groups, "rows": rows}
+    batch.preview_marker = None
     await db.commit()
+
+    # Re-check only what this answer touched, not the whole sheet.
+    #
+    # Group keys are "field::name" or "field::name::context", so the rows an
+    # answer settles are exactly the rows in the groups matching that field
+    # and source value. Row-level answers name their rows outright.
+    touched: set[int] = set()
+    for row_key in payload.rows.values():
+        touched.update(int(n) for n in row_key)
+
+    if payload.groups:
+        fields = {key.split("::", 1)[0] for key in payload.groups}
+        values = {key.split("::")[1] for key in payload.groups if "::" in key}
+        raw_rows = await _load_raw_rows(db, batch)
+        overrides = await _load_overrides(db, batch)
+        entity = get_entity(batch.entity)
+        preview_rows = []
+        for number, raw_payload in raw_rows:
+            normalized, _ = validator.normalize_row(
+                entity, raw_payload, batch.column_mapping or {},
+                date_order=batch.date_order, value_mapping=batch.value_mapping,
+                overrides=overrides.get(number),
+            )
+            preview_rows.append((number, normalized))
+        fk = await resolver.resolve_foreign_keys(
+            db, batch.entity, preview_rows,
+            decisions=_saved_group_decisions(batch),
+            row_decisions=_saved_row_decisions(batch),
+        )
+        touched |= _rows_for_groups(list(fk.groups.values()), fields, values)
+
+    if touched:
+        await _revalidate_rows(db, batch, touched)
+
+    await db.refresh(batch)
     return ImportBatchSummary.model_validate(batch)
 
 
 # ── preview ───────────────────────────────────────────────────────────────
+
+async def _revalidate_rows(
+    db: AsyncSession, batch: ImportBatch, row_numbers: set[int]
+) -> list[RowPreview]:
+    """Re-check only the named rows, through the same path the preview uses.
+
+    Answering one foreign-key question used to re-validate the whole sheet:
+    150 rows of parsing, resolving and diffing to update the handful that the
+    answer actually touched. Scoping it keeps the cost proportional to what
+    changed, and reuses preview's exact code so a scoped result can never
+    disagree with a full one.
+    """
+    if not row_numbers:
+        return []
+
+    result = await db.execute(
+        select(ImportRow).where(
+            ImportRow.batch_id == batch.id,
+            ImportRow.row_number.in_(row_numbers),
+        )
+    )
+    stored = list(result.scalars().all())
+    if not stored:
+        return []
+
+    entity = get_entity(batch.entity)
+    raw = [(row.row_number, row.raw_payload) for row in stored]
+    overrides = {r.row_number: r.overrides for r in stored if r.overrides}
+
+    prepared: dict[int, tuple[dict, list[dict]]] = {}
+    normalized_preview = []
+    for number, payload in raw:
+        values, errors = validator.normalize_row(
+            entity, payload, batch.column_mapping or {},
+            date_order=batch.date_order, value_mapping=batch.value_mapping,
+            overrides=overrides.get(number),
+        )
+        prepared[number] = (values, errors)
+        normalized_preview.append((number, values))
+
+    fk = await resolver.resolve_foreign_keys(
+        db, batch.entity, normalized_preview,
+        decisions=_saved_group_decisions(batch),
+        row_decisions=_saved_row_decisions(batch),
+    )
+    verdicts = await validator.validate_rows(
+        db, batch.entity, raw,
+        mapping=batch.column_mapping or {},
+        date_order=batch.date_order,
+        value_mapping=batch.value_mapping,
+        fk=fk,
+        migration_mode=batch.migration_mode,
+        overrides_by_row=overrides,
+        prepared=prepared,
+    )
+
+    by_number = {v.row_number: v for v in verdicts}
+    for row in stored:
+        verdict = by_number.get(row.row_number)
+        if verdict is None:
+            continue
+        row.status = verdict.status
+        row.normalized_payload = verdict.normalized
+        row.source_hash = verdict.source_hash
+        row.errors = verdict.errors or None
+        row.diff = verdict.diff
+        row.entity_id = uuid.UUID(verdict.entity_id) if verdict.entity_id else None
+
+    # A scoped re-check changes this batch's counts, so the preview cached
+    # against the old marker is no longer accurate.
+    batch.preview_marker = None
+    await db.commit()
+
+    return [
+        RowPreview(
+            row_number=v.row_number, status=v.status, errors=v.errors,
+            diff=v.diff, values=v.normalized or {},
+        )
+        for v in verdicts
+    ]
+
+
+async def _preview_from_stored(
+    db: AsyncSession,
+    batch: ImportBatch,
+    offset: int,
+    limit: int,
+    only: str | None,
+    missing: list[str],
+) -> ImportPreview | None:
+    """Serve the preview from the verdicts already on import_rows.
+
+    Only ever called when `preview_marker` proves nothing a verdict depends on
+    has changed. Returns None if anything looks incomplete, so the caller
+    falls back to a full re-validation — the cache may only ever be a
+    shortcut, never a different answer.
+
+    The foreign-key groups still have to be resolved, because the review UI
+    needs the candidate lists; that is one query and is not the cost.
+    """
+    result = await db.execute(
+        select(ImportRow).where(ImportRow.batch_id == batch.id)
+        .order_by(ImportRow.row_number)
+    )
+    stored = list(result.scalars().all())
+    if not stored or any(
+        row.status == ImportRowStatus.PENDING.value for row in stored
+    ):
+        return None
+
+    entity = get_entity(batch.entity)
+    normalized_preview = [
+        (row.row_number, dict(row.normalized_payload or {})) for row in stored
+    ]
+    fk = await resolver.resolve_foreign_keys(
+        db, batch.entity, normalized_preview,
+        decisions=_saved_group_decisions(batch),
+        row_decisions=_saved_row_decisions(batch),
+    )
+
+    counts = {
+        "create": 0, "update": 0, "skip": 0, "needs_input": 0, "error": 0,
+        "duplicate": 0, "duplicate_in_file": 0, "duplicate_in_database": 0,
+    }
+    for row in stored:
+        if row.status in counts:
+            counts[row.status] += 1
+
+    blocking = fk.blocking()
+    blockers: list[str] = []
+    if missing:
+        blockers.append(
+            f"{len(missing)} required field(s) have no column: {', '.join(missing)}"
+        )
+    if blocking:
+        blockers.append(
+            f"{len(blocking)} name(s) still need a decision before importing"
+        )
+    if counts["create"] + counts["update"] == 0:
+        blockers.append("Nothing to import — every row is a duplicate, skip or error")
+
+    shown = [r for r in stored if (only is None or r.status == only)]
+    shown.sort(key=lambda r: (ROW_SEVERITY.get(r.status, 99), r.row_number))
+
+    return ImportPreview(
+        batch=ImportBatchSummary.model_validate(batch),
+        counts=counts,
+        fk_groups=[_fk_group_out(g) for g in fk.groups.values()],
+        blocking_fk_count=len(blocking),
+        unmapped_required=missing,
+        value_mappings=_value_mappings(batch, await _load_raw_rows(db, batch)),
+        total_rows=len(shown),
+        rows=[
+            RowPreview(
+                row_number=r.row_number, status=r.status, errors=r.errors or [],
+                diff=r.diff, values=r.normalized_payload or {},
+            )
+            for r in shown[offset:offset + limit]
+        ],
+        can_commit=not blockers,
+        blockers=blockers,
+    )
+
+
+def _rows_for_groups(
+    fk_groups: list, field_names: set[str], source_values: set[str]
+) -> set[int]:
+    """Row numbers belonging to the groups an answer just settled."""
+    touched: set[int] = set()
+    for group in fk_groups:
+        if group.field in field_names and group.source_value in source_values:
+            touched.update(r.row_number for r in group.rows)
+    return touched
+
 
 @router.patch("/{batch_id}/rows/{row_number}", response_model=RowPreview)
 async def edit_row(
@@ -732,6 +964,16 @@ async def preview_import(
         )
 
     missing = matcher.unmapped_required(batch.entity, batch.column_mapping or {})
+
+    # Nothing that affects a verdict has changed since the last run, so the
+    # verdicts already on import_rows are still correct — re-deriving them
+    # would spend the whole pipeline to reproduce what is already stored.
+    marker = _preview_marker(batch)
+    if batch.preview_marker == marker:
+        cached = await _preview_from_stored(db, batch, offset, limit, only, missing)
+        if cached is not None:
+            return cached
+
     raw_rows = await _load_raw_rows(db, batch)
     overrides = await _load_overrides(db, batch)
 
@@ -785,6 +1027,7 @@ async def preview_import(
         row.diff = verdict.diff
         row.entity_id = uuid.UUID(verdict.entity_id) if verdict.entity_id else None
 
+    batch.preview_marker = marker
     counts = validator.summarize(verdicts)
     batch.create_count = counts["create"]
     batch.update_count = counts["update"]
