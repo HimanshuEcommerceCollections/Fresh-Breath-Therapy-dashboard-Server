@@ -729,10 +729,18 @@ async def _apply_updates(
 
     if not keys:
         return
-    statement = (
-        update(ctx.entity.model)
-        .where(ctx.entity.model.id == bindparam("_pk"))
-    )
+    # Table, not the ORM class — identical reasoning to _write_verdicts in
+    # routers/imports.py. An ORM-enabled UPDATE carrying its own WHERE clause
+    # and executed with a list of parameter sets is rejected by SQLAlchemy 2.0
+    # regardless of what is in the session.
+    #
+    # This path is only reached when a sheet UPDATES rows that already exist,
+    # which is why it went unnoticed: the differential's fixtures import into
+    # an empty database, so every row is a create and this line never ran. The
+    # re-import case is the whole point of the ongoing sync, so it would have
+    # failed the first time a sheet was imported twice.
+    table = ctx.entity.model.__table__
+    statement = update(table).where(table.c.id == bindparam("_pk"))
     for group in _bind_chunks(payloads, len(keys) + 1):
         await db.execute(statement, group)
 

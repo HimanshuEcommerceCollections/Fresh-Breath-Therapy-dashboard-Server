@@ -702,11 +702,30 @@ async def _write_verdicts(db: AsyncSession, batch: ImportBatch, verdicts) -> Non
         }
         for v in verdicts
     ]
+    # Against ImportRow.__table__, NOT the ORM class.
+    #
+    # An ORM-enabled UPDATE with executemany plus its own WHERE criteria is
+    # rejected outright by SQLAlchemy 2.0 — "bulk synchronize of persistent
+    # objects not supported when using bulk update with additional WHERE
+    # criteria" — because it cannot work out which in-session objects the
+    # statement touched. The guard fires on statement shape alone, so this
+    # failed on *every* preview, not intermittently.
+    #
+    # The suggested `synchronize_session=None` is not sufficient: it moves the
+    # statement onto the bulk-update-by-primary-key path, which then demands
+    # import_rows.id in every payload — a value this function deliberately
+    # doesn't have, since it keys on (batch_id, row_number).
+    #
+    # Targeting the Table sidesteps the ORM bulk machinery entirely and emits
+    # exactly what was intended: one prepared UPDATE, executed once per
+    # parameter set, keyed on the composite. Nothing here needs session
+    # synchronisation — the rows are read back as column tuples, never as
+    # persistent objects.
     statement = (
-        sa_update(ImportRow)
+        sa_update(ImportRow.__table__)
         .where(
-            ImportRow.batch_id == bindparam("_batch"),
-            ImportRow.row_number == bindparam("_row"),
+            ImportRow.__table__.c.batch_id == bindparam("_batch"),
+            ImportRow.__table__.c.row_number == bindparam("_row"),
         )
     )
     # 8 bound parameters per row; stay well under Postgres' 65,535 ceiling.
