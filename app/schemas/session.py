@@ -21,6 +21,11 @@ class SessionUpdate(BaseModel):
     time: time_type | None = None
     type: SessionType | None = None
     status: SessionStatus | None = None
+    # Reassignment. A session booked against the wrong clinician or the wrong
+    # client was previously only fixable by deleting and re-creating it, which
+    # loses the record's history and its id.
+    therapist_id: uuid.UUID | None = None
+    client_id: uuid.UUID | None = None
 
 
 class SessionSearchRequest(BaseModel):
@@ -29,6 +34,10 @@ class SessionSearchRequest(BaseModel):
     status: SessionStatus | None = None
     date_from: date_type | None = None
     date_to: date_type | None = None
+    # Free text matched against the CLIENT's and the THERAPIST's name. The
+    # admin looking for a session knows one of those two names, not a date
+    # range or an id.
+    search: str | None = None
     cursor: str | None = None
     limit: int = 25
 
