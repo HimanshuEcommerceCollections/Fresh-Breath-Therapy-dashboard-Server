@@ -344,7 +344,11 @@ PAYMENTS = EntitySpec(
     label="Payments",
     model=Payment,
     depends_on=("clients", "packages", "enrollments"),
-    natural_key=("client", "package", "date", "amount_paid"),
+    # Every field that makes one transaction distinguishable from another.
+    # Two payments from the same client, for the same package, on the same
+    # day, for the same amount, by the same method are one payment entered
+    # twice — a real second payment differs in at least one of these.
+    natural_key=("client", "package", "date", "amount_paid", "method"),
     supports_update=False,
     fields=(
         FieldSpec("client", "Client", FieldKind.FK, required=True,
