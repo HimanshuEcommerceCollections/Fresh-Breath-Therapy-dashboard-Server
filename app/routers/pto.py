@@ -129,6 +129,38 @@ async def get_pto_dashboard(
     )
 
 
+@router.get(
+    "/therapists/{therapist_id}/transactions",
+    response_model=list[PtoTransactionResponse],
+)
+async def list_therapist_pto_transactions(
+    therapist_id: uuid.UUID,
+    limit: int = 100,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin_or_coordinator()),
+):
+    """One therapist's PTO ledger, newest first.
+
+    The leaderboard only shows totals. When a balance looks wrong the question
+    is always "which entries produced it", and that needs the individual rows —
+    accruals carry the session they came from, usage carries the date and the
+    reason an admin typed.
+    """
+    if await db.get(Therapist, therapist_id) is None:
+        raise HTTPException(status_code=404, detail="Therapist not found")
+
+    result = await db.execute(
+        select(PtoTransaction)
+        .where(PtoTransaction.therapist_id == therapist_id)
+        # created_at as the tiebreaker because accruals have a NULL `date`
+        # (they're tied to a session, not a calendar day) and NULLs would
+        # otherwise order arbitrarily between runs.
+        .order_by(PtoTransaction.created_at.desc())
+        .limit(min(limit, 500))
+    )
+    return result.scalars().all()
+
+
 @router.post("/usage", response_model=PtoTransactionResponse, status_code=201)
 async def record_pto_usage(
     payload: PtoUsageCreate,

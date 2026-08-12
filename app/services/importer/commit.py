@@ -30,7 +30,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 
 from sqlalchemy import (
-    Boolean, Date, DateTime, Integer, Numeric, Time, bindparam, func,
+    Boolean, Date, DateTime, Integer, Numeric, Time, bindparam, delete, func,
     select, text, tuple_, update,
 )
 from sqlalchemy.dialects.postgresql import insert
@@ -38,7 +38,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models.enrollment import Enrollment
-from app.models.enums import EnrollmentStatus
+from app.models.enums import EnrollmentStatus, PtoTransactionType, SessionStatus
+from app.models.pto_transaction import PtoTransaction
+from app.services.pto_service import ACCRUAL_RATE
 from app.models.import_batch import ImportBatch, ImportRow, ImportRowStatus, ImportStatus
 from app.models.location import Location
 from app.models.package import Package
@@ -621,8 +623,54 @@ async def _insert_records(
     for group in _bind_chunks(payloads, len(keys)):
         await db.execute(insert(ctx.entity.model), group)
 
+    if ctx.entity.key == "sessions":
+        await _accrue_imported_sessions(db, payloads)
+
     return {row.id: _Outcome(entity_id=payload["id"])
             for row, payload in zip(order, payloads)}
+
+
+async def _accrue_imported_sessions(db: AsyncSession, payloads: list[dict]) -> None:
+    """Give imported completed sessions the same PTO accrual a dashboard-
+    completed session gets.
+
+    The normal path goes through the sessions router, which calls
+    accrue_pto_for_completed_session on the transition to COMPLETED. The
+    importer bypasses that entirely — it bulk-INSERTs, which fires no ORM
+    events — so a year of historical completed sessions used to land with zero
+    PTO. That is why the PTO dashboard read 0h accrued against 151 sessions:
+    the ledger had nothing in it.
+
+    Built as one batched INSERT rather than a call per row, to hold the
+    round-trips-per-row budget the rest of this module is written to. No
+    existence check is needed: these session ids were minted moments ago in
+    this same function, so nothing can already reference them.
+    """
+    accruals = [
+        {
+            "id": uuid7(),
+            "therapist_id": payload["therapist_id"],
+            "type": PtoTransactionType.ACCRUAL,
+            "hours": ACCRUAL_RATE,
+            "rate_applied": ACCRUAL_RATE,
+            "source_session_id": payload["id"],
+        }
+        for payload in payloads
+        if _is_completed(payload.get("status")) and payload.get("therapist_id")
+    ]
+    if not accruals:
+        return
+    for group in _bind_chunks(accruals, len(accruals[0])):
+        await db.execute(insert(PtoTransaction), group)
+
+
+def _is_completed(status) -> bool:
+    """Status arrives as either the enum or its .value, depending on whether
+    the payload came straight from _model_kwargs or survived a JSONB round
+    trip. Compare on the value so both forms agree."""
+    if status is None:
+        return False
+    return getattr(status, "value", status) == SessionStatus.COMPLETED.value
 
 
 def _enrollment_payload(values: dict, ref: str) -> dict:
@@ -1005,6 +1053,33 @@ async def rollback_batch(db: AsyncSession, batch: ImportBatch) -> dict:
     deleted = reverted = 0
     touched_enrollments: set[uuid.UUID] = set()
 
+    # Withdraw PTO accrued from the sessions this undo is about to delete.
+    #
+    # The accrual ledger is normally append-only — un-completing a session
+    # keeps the hours, because the therapist did the work. An undone import is
+    # the opposite case: those sessions never happened. Leaving the rows would
+    # inflate every therapist's balance permanently, and source_session_id is
+    # ON DELETE SET NULL, so they wouldn't even be traceable afterwards.
+    #
+    # This has to run BEFORE the delete loop below, not after. Issuing it later
+    # would autoflush the loop's pending session deletes first, the FK would
+    # SET NULL every source_session_id, and the IN clause would then match
+    # nothing at all — a silent no-op that leaves the balances wrong.
+    accruals_withdrawn = 0
+    if entity.key == "sessions":
+        doomed = {
+            row.entity_id for row in rows
+            if row.status == ImportRowStatus.CREATED.value and row.entity_id
+        }
+        if doomed:
+            result = await db.execute(
+                delete(PtoTransaction).where(
+                    PtoTransaction.source_session_id.in_(doomed),
+                    PtoTransaction.type == PtoTransactionType.ACCRUAL,
+                )
+            )
+            accruals_withdrawn = result.rowcount or 0
+
     for row in rows:
         if row.entity_id is None:
             continue
@@ -1042,7 +1117,8 @@ async def rollback_batch(db: AsyncSession, batch: ImportBatch) -> dict:
     await db.commit()
 
     return {"deleted": deleted, "reverted": reverted,
-            "enrollments_recomputed": len(touched_enrollments)}
+            "enrollments_recomputed": len(touched_enrollments),
+            "pto_accruals_withdrawn": accruals_withdrawn}
 
 
 async def _recompute_enrollment(db: AsyncSession, enrollment_id: uuid.UUID) -> None:
