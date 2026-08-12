@@ -77,6 +77,12 @@ class Settings(BaseSettings):
     # path produces identical output.
     IMPORT_CHUNK_TIER_SIZES: list[int] = [200, 25]
 
+    # How long one import may spend writing before it is judged failed,
+    # its claim released and the entity handed to the next queued batch.
+    # Generous: a 5,000-row import measures around 3 minutes, so this is
+    # a stuck-run backstop rather than a normal-operation limit.
+    IMPORT_MAX_RUNTIME_SECONDS: int = 600
+
     class Config:
         env_file = ".env"
         extra = "ignore"

@@ -1140,22 +1140,40 @@ async def commit_import(
             detail="Review the preview before committing this import.",
         )
 
-    # One import at a time, across every admin and every browser tab.
+    # Release anything that has outstayed its time limit, so a stuck run does
+    # not hold this entity forever. Checked before claiming, not on a timer —
+    # there is no scheduler on a serverless host to run one.
+    await commit_service.reap_expired_runs(db, batch.entity)
+    await db.refresh(batch)
+
+    # One import at a time PER ENTITY.
     #
-    # Both imports were validated against the database as it stood before
-    # either began, so running them together means the second one's duplicate
-    # checks, enrollment-cycle guard and payment balances are all reasoning
-    # about a state the first is actively changing. Serialising is what keeps
-    # the verdicts the admin approved true at the moment they're applied.
-    running = await commit_service.find_running_import(db, other_than=batch.id)
+    # Two imports into different tables do not contend, so they no longer wait
+    # on each other. Same-entity still must: two payments imports against one
+    # enrollment would each compute their balance chain from the same starting
+    # total, and the second would silently overwrite the first's arithmetic.
+    #
+    # A second request is QUEUED rather than refused. The admin asked for it;
+    # losing the request because someone else was a second earlier is worse
+    # than making it wait. Her client keeps polling and it starts by itself
+    # when the entity frees up.
+    running = await commit_service.find_running_import(
+        db, batch.entity, other_than=batch.id
+    )
     if running is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f'"{running.filename}" is being imported right now. Wait for it '
-                "to finish, then start this one — running two at once could "
-                "produce duplicates neither preview predicted."
-            ),
+        if batch.status != ImportStatus.QUEUED.value:
+            batch.status = ImportStatus.QUEUED.value
+            batch.queued_at = datetime.now(timezone.utc)
+            await db.commit()
+        ahead = await commit_service.queue_position(db, batch)
+        return CommitResult(
+            processed=0, created=0, updated=0, failed=0,
+            remaining=batch.create_count + batch.update_count,
+            done=False,
+            queued=True,
+            queue_position=ahead,
+            queued_behind=running.filename,
+            batch=ImportBatchSummary.model_validate(batch),
         )
 
     # Re-check the blockers server-side. The UI disables the button, but the

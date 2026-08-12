@@ -63,7 +63,21 @@ STALE_CLAIM_AFTER = timedelta(minutes=5)
 # Arbitrary but fixed: every import commit contends for this one advisory
 # lock, so two can never write concurrently even if both somehow passed the
 # `committing` status check.
-_ADVISORY_LOCK_KEY = 0x1_50_1_1_0_0_7  # "IMPORT" in a shape that fits a bigint
+_ADVISORY_LOCK_KEY = 0x1_50_1_1_0_0_7  # "IMPORT" in a shape that fits an int32
+
+
+def _entity_lock_key(entity: str) -> int:
+    """Stable per-entity classid for pg_try_advisory_xact_lock(int, int).
+
+    Index into ENTITY_ORDER rather than a hash, so the value is small,
+    readable in pg_locks, and cannot collide.
+    """
+    from app.services.importer.registry import ENTITY_ORDER
+
+    try:
+        return ENTITY_ORDER.index(entity)
+    except ValueError:
+        return len(ENTITY_ORDER)
 
 
 def _tier_sizes() -> list[int]:
@@ -87,30 +101,122 @@ class CommitProgress:
     done: bool
 
 
-async def find_running_import(
-    db: AsyncSession, *, other_than: uuid.UUID | None = None
-) -> ImportBatch | None:
-    """The batch currently being written, if any.
+async def reap_expired_runs(db: AsyncSession, entity: str | None = None) -> list[str]:
+    """Fail any run that has exceeded its time limit, and release its claim.
 
-    Imports are deliberately serialised. Two running at once can interleave
-    in ways neither preview predicted: both were validated against the
-    database as it stood BEFORE either started, so the second one's duplicate
-    checks, its "is there already an active enrollment" guard and its running
-    payment balances are all reasoning about a state that the first is busy
-    changing underneath it. Refusing the second is the only cheap way to keep
-    every verdict the admin approved actually true at the moment it is applied.
+    A run is judged on `run_started_at`, not `updated_at`: a chunk loop that
+    keeps making progress still bumps the heartbeat, so a heartbeat can only
+    tell you a run is alive — never that it has taken too long.
+
+    An expired run goes back to PREVIEW rather than to a dead FAILED state,
+    with the reason on `last_failure`. That is what makes Resume appear: the
+    rows it already wrote keep their CREATED/UPDATED status, so resuming picks
+    up exactly where it stopped instead of writing anything twice.
+
+    Deliberately NOT undoing the rows already written. "Rolled back as failed"
+    could mean that, but undoing good writes and redoing them is strictly
+    worse here — it doubles the work, and for payments it would unwind a
+    partially-applied balance chain that the remaining rows are computed
+    against. Status-based resumption already gives exactly-once writing.
     """
+    cutoff = datetime.now(timezone.utc) - timedelta(
+        seconds=settings.IMPORT_MAX_RUNTIME_SECONDS
+    )
     query = select(ImportBatch).where(
         ImportBatch.status == ImportStatus.COMMITTING.value,
+        ImportBatch.run_started_at.isnot(None),
+        ImportBatch.run_started_at < cutoff,
+    )
+    if entity is not None:
+        query = query.where(ImportBatch.entity == entity)
+
+    reaped = []
+    for batch in (await db.execute(query)).scalars().all():
+        minutes = settings.IMPORT_MAX_RUNTIME_SECONDS // 60
+        batch.status = ImportStatus.PREVIEW.value
+        batch.last_failure = (
+            f"Timed out after {minutes} minute(s). "
+            f"{batch.commit_cursor} row(s) were written and are kept — "
+            "resuming continues from there."
+        )
+        batch.run_started_at = None
+        reaped.append(str(batch.id))
+    if reaped:
+        await db.commit()
+    return reaped
+
+
+async def find_running_import(
+    db: AsyncSession, entity: str, *, other_than: uuid.UUID | None = None
+) -> ImportBatch | None:
+    """The batch currently writing to THIS entity, if any.
+
+    Serialised per entity rather than globally. Two imports into different
+    tables genuinely do not contend: a therapists import and a sessions import
+    touch different rows, and making one wait for the other bought nothing.
+
+    Same-entity is where it matters, and payments are the clearest case: two
+    payments imports against one enrollment would each compute their
+    balance_after chain from the same starting total, and the second would
+    silently overwrite the first's arithmetic.
+
+    Residual risk, accepted and worth naming: entities are not perfectly
+    independent. A payments import can auto-create an enrollment, and a
+    clients import can create the client a concurrent sessions import is
+    trying to resolve. Neither corrupts data — the partial unique index
+    rejects a duplicate active enrollment as a normal row failure, and an
+    unresolvable name was already NEEDS_INPUT before either started. What can
+    happen is a verdict going stale mid-run, which surfaces as a failed or
+    parked row rather than a wrong one.
+    """
+    query = select(ImportBatch).where(
+        ImportBatch.entity == entity,
+        ImportBatch.status == ImportStatus.COMMITTING.value,
         # Self-releasing. An admin who closes the tab mid-import would
-        # otherwise leave the batch claimed forever and every future import
-        # blocked, with no way to clear it. Each chunk bumps updated_at, so a
-        # live import keeps renewing its claim and an abandoned one lapses.
+        # otherwise leave the entity claimed forever, with no way to clear it.
+        # Each chunk bumps updated_at, so a live run renews its claim and an
+        # abandoned one lapses.
         ImportBatch.updated_at > datetime.now(timezone.utc) - STALE_CLAIM_AFTER,
     )
     if other_than is not None:
         query = query.where(ImportBatch.id != other_than)
     return (await db.execute(query.limit(1))).scalar_one_or_none()
+
+
+async def queue_position(db: AsyncSession, batch: ImportBatch) -> int:
+    """How many queued batches for this entity are ahead of this one."""
+    return int(await db.scalar(
+        select(func.count()).select_from(ImportBatch).where(
+            ImportBatch.entity == batch.entity,
+            ImportBatch.status == ImportStatus.QUEUED.value,
+            ImportBatch.queued_at < (batch.queued_at or datetime.now(timezone.utc)),
+        )
+    ) or 0)
+
+
+async def promote_next_queued(db: AsyncSession, entity: str) -> ImportBatch | None:
+    """Hand the entity to whoever has waited longest.
+
+    Called when a run finishes, so the queue drains without a worker process:
+    the promoted batch returns to PREVIEW, and its own client — which is
+    polling — picks it up on the next tick. That keeps this serverless-safe
+    with no scheduler and no external queue.
+    """
+    nxt = (await db.execute(
+        select(ImportBatch)
+        .where(
+            ImportBatch.entity == entity,
+            ImportBatch.status == ImportStatus.QUEUED.value,
+        )
+        .order_by(ImportBatch.queued_at)
+        .limit(1)
+    )).scalar_one_or_none()
+    if nxt is None:
+        return None
+    nxt.status = ImportStatus.PREVIEW.value
+    nxt.queued_at = None
+    await db.commit()
+    return nxt
 
 
 def external_ref_for(batch_id: uuid.UUID, row_number: int) -> str:
@@ -775,6 +881,11 @@ async def commit_chunk(
     # possible — a claim nobody can see protects nothing.
     if batch.status != ImportStatus.COMMITTING.value:
         batch.status = ImportStatus.COMMITTING.value
+        # Fixed start for the time limit. Only set when the run actually
+        # begins, so resuming a timed-out batch restarts its clock rather than
+        # inheriting an already-expired one.
+        batch.run_started_at = datetime.now(timezone.utc)
+        batch.queued_at = None
         await db.commit()
 
     # Fail loudly rather than holding locks. A commit that wedges — a lock
@@ -789,8 +900,12 @@ async def commit_chunk(
     # deliberately: pg_advisory_lock needs session affinity, which a
     # transaction pooler cannot promise — the lock would be taken on one
     # backend and the release attempted on another.
+    # Keyed per ENTITY: a payments import and a clients import contend for
+    # nothing, so they must not contend for the same lock either.
     claimed = await db.scalar(
-        select(func.pg_try_advisory_xact_lock(_ADVISORY_LOCK_KEY))
+        select(func.pg_try_advisory_xact_lock(
+            _ADVISORY_LOCK_KEY, _entity_lock_key(batch.entity)
+        ))
     )
     if not claimed:
         raise RuntimeError(
@@ -845,10 +960,18 @@ async def commit_chunk(
     if remaining == 0:
         batch.status = ImportStatus.COMMITTED.value
         batch.committed_at = datetime.now(timezone.utc)
+        batch.run_started_at = None
+        batch.last_failure = None
     else:
         batch.status = ImportStatus.COMMITTING.value
 
     await db.commit()
+
+    # Finished with this entity — hand it to whoever has waited longest. Their
+    # client is polling and will pick it up, so the queue drains without a
+    # worker process.
+    if remaining == 0:
+        await promote_next_queued(db, batch.entity)
 
     return CommitProgress(
         processed=len(rows), created=created, updated=updated, failed=failed,
