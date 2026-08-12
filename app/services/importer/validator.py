@@ -20,6 +20,7 @@ recognised by its hash and skipped without comparing a single field.
 """
 from __future__ import annotations
 
+import enum as py_enum
 import hashlib
 import json
 import logging
@@ -31,6 +32,8 @@ from decimal import Decimal
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.enrollment import Enrollment
+from app.models.enums import EnrollmentStatus
 from app.models.import_batch import ImportRowStatus
 from app.services.importer import normalizers
 from app.services.importer.registry import (
@@ -60,6 +63,11 @@ class RowVerdict:
     source_hash: str | None = None
     # The existing record this row matched, if any.
     entity_id: str | None = None
+    # For DUPLICATE rows: "file" (an earlier row in this same sheet) or
+    # "database" (a record that already exists). Kept apart so the summary can
+    # say which — "fix your spreadsheet" and "already imported" are different
+    # problems with different actions.
+    duplicate_source: str | None = None
 
 
 def _jsonable(value):
@@ -68,7 +76,33 @@ def _jsonable(value):
         return value.isoformat()
     if isinstance(value, Decimal):
         return str(value)
+    if isinstance(value, py_enum.Enum):
+        # The VALUE, not the member. str(PaymentMethod.CASH) is
+        # "PaymentMethod.CASH", while a sheet supplies "cash" — so a natural
+        # key containing an enum could never match an existing row, and every
+        # already-recorded payment looked brand new.
+        return value.value
+    if isinstance(value, uuid.UUID):
+        return str(value)
     return value
+
+
+def _key_part(value) -> str:
+    """One component of a natural key, rendered so equal values compare equal.
+
+    Money is the reason this isn't just str(): a sheet's "400" parses to
+    Decimal("400.00") while the same amount already stored can be in hand as
+    Decimal("400"). Numerically identical, textually not — and comparing the
+    text made every already-recorded payment look brand new.
+    """
+    if isinstance(value, Decimal):
+        try:
+            return str(value.quantize(Decimal("0.01")))
+        except (ArithmeticError, ValueError):
+            return str(value)
+    if isinstance(value, float):
+        return str(Decimal(str(value)).quantize(Decimal("0.01")))
+    return str(_jsonable(value)).strip().lower()
 
 
 def _hash(normalized: dict) -> str:
@@ -193,7 +227,7 @@ def natural_key(entity: EntitySpec, values: dict) -> str | None:
         value = values.get(name)
         if value is None or value == "":
             return None  # incomplete key identifies nothing
-        parts.append(str(_jsonable(value)).strip().lower())
+        parts.append(_key_part(value))
     return "|".join(parts)
 
 
@@ -232,6 +266,43 @@ async def load_existing_index(
             by_key[key] = row
 
     return by_ref, by_key
+
+
+# ── enrollment cycles ─────────────────────────────────────────────────────
+
+def _cycle_key(values: dict) -> str:
+    """(client, package) — the pair the database allows one ACTIVE row for."""
+    return f"{values.get('client')}|{values.get('package')}"
+
+
+async def load_active_cycles(db: AsyncSession) -> dict[str, str]:
+    """(client, package) pairs that already have an unfinished enrollment.
+
+    An enrollment completes when its payments cover the price — until then a
+    second one for the same client and package can't be started. Postgres
+    already enforces this with a partial unique index, but hitting it at
+    INSERT means a raw constraint violation halfway through a commit. Catching
+    it here turns it into a sentence on the review screen, before anything is
+    written, naming exactly what's outstanding.
+
+    Note this is keyed on client + package only, not therapist: an enrollment
+    records who bought what, not who delivers it, so changing therapist does
+    not start a new purchase cycle.
+    """
+    result = await db.execute(
+        select(Enrollment).where(Enrollment.status == EnrollmentStatus.ACTIVE)
+    )
+    cycles: dict[str, str] = {}
+    for row in result.scalars().all():
+        paid = Decimal(str(row.total_paid or 0))
+        price = Decimal(str(row.package_price_snapshot or 0))
+        outstanding = price - paid
+        cycles[f"{row.client_id}|{row.package_id}"] = (
+            "This client already has an active enrollment for this package "
+            f"(${paid:,.2f} of ${price:,.2f} paid, ${outstanding:,.2f} "
+            "outstanding). Finish paying it off before starting another."
+        )
+    return cycles
 
 
 # ── diffing an update ─────────────────────────────────────────────────────
@@ -302,10 +373,18 @@ async def validate_rows(
     overrides_by_row = overrides_by_row or {}
     by_ref, by_key = await load_existing_index(db, entity)
     ref_field = "external_id" if entity.key == "leads" else "external_ref"
+    # Only enrollments have a one-active-cycle rule; None everywhere else
+    # keeps the check out of the hot loop entirely.
+    active_cycles = (
+        await load_active_cycles(db) if entity.key == "enrollments" else None
+    )
 
     verdicts: list[RowVerdict] = []
     # Rows within one file can collide with each other, not just with the
     # database — the same client listed twice, the same payment pasted twice.
+    # Two levels: an identical ROW is a duplicate to skip; the same record
+    # described two different ways is a contradiction to report.
+    seen_hashes: dict[str, int] = {}
     seen_keys: dict[str, int] = {}
 
     for row_number, raw_payload in rows:
@@ -374,15 +453,36 @@ async def validate_rows(
         if existing is None and key:
             existing = by_key.get(key)
 
-        if key and key in seen_keys and existing is None:
+        # ── the same row twice in the same file ───────────────────────────
+        # Compared on the FULL row (source_hash), not just the natural key.
+        # Two rows sharing a key but differing anywhere else are not the same
+        # entry — they're the sheet contradicting itself about one record, and
+        # collapsing them would silently pick whichever came first.
+        if source_hash in seen_hashes:
+            verdicts.append(RowVerdict(
+                row_number=row_number, status=ImportRowStatus.DUPLICATE.value,
+                normalized=jsonable, source_hash=source_hash,
+                duplicate_source="file",
+                errors=[{
+                    "field": None, "column": None,
+                    "message": (
+                        f"Identical to row {seen_hashes[source_hash]} in this "
+                        "file — importing once."
+                    ),
+                }],
+            ))
+            continue
+        seen_hashes[source_hash] = row_number
+
+        if key and key in seen_keys:
             verdicts.append(RowVerdict(
                 row_number=row_number, status=ImportRowStatus.ERROR.value,
                 normalized=jsonable, source_hash=source_hash,
                 errors=[{
                     "field": None, "column": None,
                     "message": (
-                        f"Duplicates row {seen_keys[key]} in this same file. "
-                        "Remove one of them."
+                        f"Row {seen_keys[key]} describes this same record "
+                        "differently. Decide which is right and remove the other."
                     ),
                 }],
             ))
@@ -391,6 +491,23 @@ async def validate_rows(
             seen_keys.setdefault(key, row_number)
 
         if existing is None:
+            # A cycle that cannot start until the previous one is settled.
+            conflict = active_cycles.get(_cycle_key(normalized)) if active_cycles else None
+            if conflict is not None:
+                verdicts.append(RowVerdict(
+                    row_number=row_number, status=ImportRowStatus.ERROR.value,
+                    normalized=jsonable, source_hash=source_hash,
+                    errors=[{"field": None, "column": None, "message": conflict}],
+                ))
+                continue
+            if active_cycles is not None:
+                # Claim the pair so a SECOND row in this same sheet for the
+                # same client and package is caught too, not just a clash with
+                # what's already in the database.
+                active_cycles[_cycle_key(normalized)] = (
+                    f"Row {row_number} of this file already starts an enrollment "
+                    "for this client and package. Only one can be active at a time."
+                )
             verdicts.append(RowVerdict(
                 row_number=row_number, status=ImportRowStatus.CREATE.value,
                 normalized=jsonable, source_hash=source_hash,
@@ -398,19 +515,42 @@ async def validate_rows(
             continue
 
         if not entity.supports_update:
-            # Payments: the ledger is append-only, so a transaction we already
-            # hold is left exactly as it is.
+            # Payments: the ledger is append-only. An identical transaction
+            # already on file is the same payment entered twice — the natural
+            # key covers client, package, date, amount AND method, so a real
+            # second payment differs somewhere and lands as a CREATE above.
             verdicts.append(RowVerdict(
-                row_number=row_number, status=ImportRowStatus.SKIP.value,
+                row_number=row_number, status=ImportRowStatus.DUPLICATE.value,
                 normalized=jsonable, source_hash=source_hash,
-                entity_id=str(existing.id),
-                diff={"note": "Already recorded — payments are never re-written."},
+                entity_id=str(existing.id), duplicate_source="database",
+                errors=[{
+                    "field": None, "column": None,
+                    "message": (
+                        "This exact payment is already recorded — same client, "
+                        "package, date, amount and method."
+                    ),
+                }],
             ))
             continue
 
         changes, refused = _diff(
             entity, existing, normalized, migration_mode=migration_mode
         )
+
+        if not changes and not refused:
+            # Every field matches what's already stored: importing it would
+            # write nothing at all.
+            verdicts.append(RowVerdict(
+                row_number=row_number, status=ImportRowStatus.DUPLICATE.value,
+                normalized=jsonable, source_hash=source_hash,
+                entity_id=str(existing.id), duplicate_source="database",
+                errors=[{
+                    "field": None, "column": None,
+                    "message": "Already in the dashboard, with nothing different.",
+                }],
+            ))
+            continue
+
         status = (
             ImportRowStatus.UPDATE.value if changes else ImportRowStatus.SKIP.value
         )
@@ -418,17 +558,30 @@ async def validate_rows(
             row_number=row_number, status=status,
             normalized=jsonable, source_hash=source_hash,
             entity_id=str(existing.id),
-            diff={"changes": changes, "refused": refused} if (changes or refused) else None,
+            diff={"changes": changes, "refused": refused},
         ))
 
     return verdicts
 
 
 def summarize(verdicts: list[RowVerdict]) -> dict[str, int]:
+    """Per-status totals, plus the two duplicate sub-totals.
+
+    Duplicates are split because the two have different meanings: one says the
+    spreadsheet repeats itself, the other says this was imported already. Both
+    are reported so the gap between "150 rows" and "142 imported" is never
+    unexplained.
+    """
     counts = {
         "create": 0, "update": 0, "skip": 0, "needs_input": 0, "error": 0,
+        "duplicate": 0, "duplicate_in_file": 0, "duplicate_in_database": 0,
     }
     for verdict in verdicts:
         if verdict.status in counts:
             counts[verdict.status] += 1
+        if verdict.status == ImportRowStatus.DUPLICATE.value:
+            if verdict.duplicate_source == "file":
+                counts["duplicate_in_file"] += 1
+            elif verdict.duplicate_source == "database":
+                counts["duplicate_in_database"] += 1
     return counts

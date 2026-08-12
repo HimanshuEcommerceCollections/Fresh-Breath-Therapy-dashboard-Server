@@ -65,9 +65,12 @@ ROW_SEVERITY = {
     ImportRowStatus.ERROR.value: 0,
     ImportRowStatus.FAILED.value: 0,
     ImportRowStatus.NEEDS_INPUT.value: 1,
-    ImportRowStatus.UPDATE.value: 2,   # changes an existing record — worth a look
-    ImportRowStatus.CREATE.value: 3,
-    ImportRowStatus.SKIP.value: 4,     # nothing changes; least interesting
+    # Above the successes: a duplicate needs no action, but the admin has to
+    # be able to see WHY 150 rows became 142 without hunting for it.
+    ImportRowStatus.DUPLICATE.value: 2,
+    ImportRowStatus.UPDATE.value: 3,   # changes an existing record — worth a look
+    ImportRowStatus.CREATE.value: 4,
+    ImportRowStatus.SKIP.value: 5,     # nothing changes; least interesting
 }
 
 _SHEETS_ID = re.compile(r"docs\.google\.com/spreadsheets/d/([a-zA-Z0-9-_]+)")
@@ -806,7 +809,16 @@ async def preview_import(
             f"{len(blocking)} name(s) still need a decision before importing"
         )
     if counts["create"] + counts["update"] == 0:
-        blockers.append("Nothing to import — every row is a skip or an error")
+        # Say WHICH kind of nothing. "Every row is already imported" and
+        # "every row failed" both leave zero to write and want opposite
+        # reactions from the admin.
+        if counts.get("duplicate") and not counts["error"]:
+            blockers.append(
+                f"Nothing new to import — all {counts['duplicate']} row(s) are "
+                "already in the dashboard or repeated in this file"
+            )
+        else:
+            blockers.append("Nothing to import — every row is a duplicate, skip or error")
 
     shown = [v for v in verdicts if (only is None or v.status == only)]
     # Problems first, then row order within each group.

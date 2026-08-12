@@ -47,7 +47,14 @@ class ImportRowStatus(str, enum.Enum):
     PENDING = "pending"        # not yet validated
     CREATE = "create"          # validated; will insert
     UPDATE = "update"          # validated; matches an existing row, will patch
-    SKIP = "skip"              # matches an existing row, nothing changed
+    SKIP = "skip"              # matches an existing row, nothing to write
+    # Deliberately distinct from SKIP and from ERROR. A duplicate is not the
+    # admin's mistake to go and fix (ERROR), and it is not a silent no-op
+    # (SKIP) — it's a row that was consciously not imported because the exact
+    # same record already exists, either earlier in this file or in the
+    # database. It gets counted and reported so "150 rows in, 148 imported"
+    # is always explainable.
+    DUPLICATE = "duplicate"
     NEEDS_INPUT = "needs_input"  # blocked on an ambiguous FK the admin must resolve
     ERROR = "error"            # failed validation; will not be committed
     CREATED = "created"        # committed
