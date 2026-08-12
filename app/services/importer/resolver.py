@@ -34,7 +34,7 @@ import uuid
 from dataclasses import dataclass, field as dc_field
 from difflib import get_close_matches
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -67,6 +67,12 @@ DISAMBIGUATOR_OF = {
     "therapists": lambda t: getattr(t.location, "name", None),
     "clients": lambda c: c.email,
 }
+
+# How many records to offer when a name matched nothing and the admin has to
+# pick from the existing list. Bounded because the picker is searchable — an
+# unbounded pool would pull a whole table to populate a dropdown, which is the
+# exact cost Phase 5 exists to remove.
+CANDIDATE_POOL = 500
 
 
 class FkStatus:
@@ -169,15 +175,37 @@ def _norm(value) -> str:
     return str(value or "").strip().lower()
 
 
-async def _load_index(db: AsyncSession, target: str) -> dict[str, list]:
-    """Every existing row of `target`, keyed by each of its lookup values.
+async def _load_index(
+    db: AsyncSession, target: str, wanted: set[str] | None = None,
+    *, limit: int | None = None,
+) -> dict[str, list]:
+    """Existing rows of `target`, keyed by each of their lookup values.
 
     One query per referenced entity for the whole batch, rather than a query
     per row. Two Sarah Chens land in the same list, which is precisely the
     ambiguity this module exists to resolve.
+
+    `wanted` bounds it to the names the sheet actually mentions. Without it
+    this pulled the ENTIRE table: fine against 150 therapists, ruinous against
+    50,000, and the cost grew with the clinic rather than with the import. The
+    round-trip count is unchanged — it is still exactly one query — but the
+    rows crossing the wire are now proportional to the sheet.
+
+    A near-miss suggestion for a name that matches nothing still needs
+    candidates to compare against, so the caller widens `wanted` when it has
+    unmatched names; see resolve_foreign_keys.
     """
     model = MODELS[target]
     query = select(model)
+    if limit is not None:
+        query = query.limit(limit)
+    if wanted:
+        lowered = {w.strip().lower() for w in wanted if w and w.strip()}
+        if lowered:
+            conditions = [
+                func.lower(column).in_(lowered) for column in LOOKUP_COLUMNS[target]
+            ]
+            query = query.where(or_(*conditions))
     if target == "therapists":
         # location is both part of the label and the disambiguator.
         query = query.options(selectinload(Therapist.location))
@@ -293,8 +321,35 @@ async def resolve_foreign_keys(
     decisions = decisions or {}
     row_decisions = row_decisions or {}
 
+    # Collect the names the sheet mentions FIRST, so each entity is fetched
+    # bounded by the import rather than by the size of the table.
+    wanted: dict[str, set[str]] = {}
+    for spec in fk_specs:
+        bucket = wanted.setdefault(spec.fk_entity, set())
+        for _, values in rows:
+            raw = values.get(spec.name)
+            if raw is not None and str(raw).strip():
+                bucket.add(str(raw).strip())
+
     targets = {spec.fk_entity for spec in fk_specs}
-    indexes = {target: await _load_index(db, target) for target in targets}
+    indexes = {
+        target: await _load_index(db, target, wanted.get(target))
+        for target in targets
+    }
+
+    # A name the sheet mentions that matched nothing still needs two things
+    # the bounded index cannot supply: a list of records to pick from, and a
+    # near-miss suggestion to compare against. Both need the wider table — so
+    # for those targets ONLY, and only when something actually failed to
+    # match, load a capped pool. A clean import never pays for this.
+    pools: dict[str, dict[str, list]] = {}
+    for target in targets:
+        unmatched = [
+            name for name in wanted.get(target, set())
+            if _norm(name) not in indexes[target]
+        ]
+        if unmatched:
+            pools[target] = await _load_index(db, target, None, limit=CANDIDATE_POOL)
 
     groups: dict[str, FkGroup] = {}
     row_assignments: dict[tuple[str, int], str | None] = {}
@@ -340,17 +395,18 @@ async def resolve_foreign_keys(
                     )
                     continue
 
-                near = get_close_matches(_norm(name), list(index.keys()), n=1, cutoff=0.75)
+                pool = pools.get(spec.fk_entity, index)
+                near = get_close_matches(_norm(name), list(pool.keys()), n=1, cutoff=0.75)
                 suggestion = None
-                if near and index[near[0]]:
-                    match = index[near[0]][0]
+                if near and pool[near[0]]:
+                    match = pool[near[0]][0]
                     suggestion = FkCandidate(
                         id=str(match.id), label=_label(spec.fk_entity, match)
                     )
                 _emit(
                     groups, row_assignments, row_groups, spec, name, None,
                     all_rows, FkStatus.MISSING,
-                    candidates=_candidates(spec.fk_entity, _unique(index))[:200],
+                    candidates=_candidates(spec.fk_entity, _unique(pool))[:200],
                     suggestion=suggestion,
                     message=(
                         f'No {spec.fk_entity[:-1]} named "{name}". Pick one, or '
