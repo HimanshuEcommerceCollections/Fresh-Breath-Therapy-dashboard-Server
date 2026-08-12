@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
+import platform
 import io
 import csv
 import sys
@@ -31,15 +33,19 @@ from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(BACKEND / ".env")
 
-from sqlalchemy import delete, func, select  # noqa: E402
+from sqlalchemy import delete, func, or_, select  # noqa: E402
 
 from app.config import settings  # noqa: E402
 from app.database import AsyncSessionLocal, engine  # noqa: E402
 from app.models.client import Client  # noqa: E402
+from app.models.enrollment import Enrollment  # noqa: E402
 from app.models.import_batch import (  # noqa: E402
     ImportBatch, ImportRow, ImportStatus,
 )
 from app.models.location import Location  # noqa: E402
+from app.models.package import Package  # noqa: E402
+from app.models.payment import Payment  # noqa: E402
+from app.models.session import Session  # noqa: E402
 from app.models.therapist import Therapist  # noqa: E402
 from app.services.importer import commit as commit_service  # noqa: E402
 from app.services.importer import matcher, profiling, resolver, validator  # noqa: E402
@@ -66,8 +72,48 @@ def make_sheet(rows: int) -> bytes:
 
 
 async def cleanup(db) -> int:
-    """Remove everything this script created. Prefix-scoped, nothing else."""
+    """Remove everything this script created, CHILDREN FIRST.
+
+    This writes to a database holding patient records. Deleting a client while
+    leaving its payments behind would orphan ledger rows, and an orphaned
+    payment silently corrupts the balance_after chain of every future import
+    for that enrollment — so the order below is load-bearing, not tidiness.
+
+    Everything is scoped to BENCH_PREFIX. Nothing without that prefix is ever
+    touched.
+    """
     removed = 0
+
+    clients = (await db.execute(
+        select(Client.id).where(Client.name.like(f"{BENCH_PREFIX}%"))
+    )).scalars().all()
+    therapists = (await db.execute(
+        select(Therapist.id).where(Therapist.name.like(f"{BENCH_PREFIX}%"))
+    )).scalars().all()
+    packages = (await db.execute(
+        select(Package.id).where(Package.name.like(f"{BENCH_PREFIX}%"))
+    )).scalars().all()
+
+    if clients or packages:
+        # Ledger first, then the cycles it hangs off.
+        for model in (Payment, Enrollment):
+            conditions = []
+            if clients:
+                conditions.append(model.client_id.in_(clients))
+            if packages:
+                conditions.append(model.package_id.in_(packages))
+            result = await db.execute(delete(model).where(or_(*conditions)))
+            removed += result.rowcount or 0
+
+    if clients or therapists:
+        conditions = []
+        if clients:
+            conditions.append(Session.client_id.in_(clients))
+        if therapists:
+            conditions.append(Session.therapist_id.in_(therapists))
+        result = await db.execute(delete(Session).where(or_(*conditions)))
+        removed += result.rowcount or 0
+
     batches = (await db.execute(
         select(ImportBatch.id).where(ImportBatch.filename.like(f"{BENCH_PREFIX}%"))
     )).scalars().all()
@@ -75,12 +121,14 @@ async def cleanup(db) -> int:
         await db.execute(delete(ImportRow).where(ImportRow.batch_id.in_(batches)))
         await db.execute(delete(ImportBatch).where(ImportBatch.id.in_(batches)))
         removed += len(batches)
-    for model, column in ((Therapist, Therapist.name), (Client, Client.name),
-                          (Location, Location.name)):
+
+    for model, column in ((Client, Client.name), (Therapist, Therapist.name),
+                          (Package, Package.name), (Location, Location.name)):
         result = await db.execute(
             delete(model).where(column.like(f"{BENCH_PREFIX}%"))
         )
         removed += result.rowcount or 0
+
     await db.commit()
     return removed
 
@@ -193,8 +241,21 @@ async def main() -> None:
     ap.add_argument("--keep", action="store_true", help="don't clean up fixtures")
     args = ap.parse_args()
 
+    # This benchmark writes and deletes real records in a database holding
+    # patient data. It is prefix-scoped and cleans up after itself, but that
+    # is not a reason to let it start because someone ran the wrong file.
+    if os.getenv("BENCH_IMPORT_ALLOW_WRITES") != "1":
+        print(
+            "REFUSING TO RUN.\n\n"
+            "This benchmark writes and deletes real records in a database\n"
+            "that holds patient data. It cleans up after itself, scoped to\n"
+            f"the {BENCH_PREFIX} prefix, but it must be opted into:\n\n"
+            "  PowerShell:  $env:BENCH_IMPORT_ALLOW_WRITES=1\n"
+            "  bash:        export BENCH_IMPORT_ALLOW_WRITES=1\n"
+        )
+        sys.exit(2)
+
     profiling.install(engine)
-    import platform, os
     where = os.getenv("VERCEL_REGION") or f"dev machine ({platform.node()})"
     print(f"run from: {where}")
     print(f"db: mode={settings.db_pool_mode} endpoint={settings.db_endpoint} "
