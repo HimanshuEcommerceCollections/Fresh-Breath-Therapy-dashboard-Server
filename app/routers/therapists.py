@@ -65,7 +65,12 @@ async def list_therapists(
     query = select(Therapist).options(selectinload(Therapist.location))
     if location_id:
         query = query.where(Therapist.location_id == location_id)
-    result = await db.execute(query.order_by(Therapist.name))
+    # Active therapists first, alphabetical within each group. An inactive
+    # therapist is a record kept for history — it should never sit above
+    # someone currently seeing clients just because the name sorts earlier.
+    result = await db.execute(
+        query.order_by(Therapist.is_active.desc(), Therapist.name)
+    )
     therapists = result.scalars().all()
     return await _attach_computed_fields(db, therapists)
 
