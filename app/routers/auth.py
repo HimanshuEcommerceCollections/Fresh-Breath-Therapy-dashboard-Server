@@ -2,6 +2,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.orm import joinedload
 from sqlalchemy.orm import selectinload
 from app.database import get_db
 from app.models.user import User
@@ -69,7 +70,11 @@ async def verify_login_otp(
     response: Response,
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(select(User).where(User.email == payload.email))
+    # joinedload the role: it is needed to serialise UserResponse below, and
+    # loading it here costs nothing extra — it is the same round trip.
+    result = await db.execute(
+        select(User).options(joinedload(User.role)).where(User.email == payload.email)
+    )
     user = result.scalar_one_or_none()
     if user is None:
         raise HTTPException(status_code=400, detail="Invalid request")
@@ -78,7 +83,13 @@ async def verify_login_otp(
         await verify_otp(db, user.id, purpose="login", code=payload.code)
 
     _set_access_token_cookie(response, user.id)
-    return VerifyOtpResponse(detail="Login successful")
+    # The user rides back with the verification so the client can populate its
+    # session cache and route straight to the dashboard. An account with no
+    # role yet is still pending approval, so there is nothing useful to send.
+    return VerifyOtpResponse(
+        detail="Login successful",
+        user=UserResponse.model_validate(user) if user.role_id else None,
+    )
 
 
 @router.post("/resend-otp", response_model=OtpRequestResponse)

@@ -36,31 +36,48 @@ async def get_dashboard(
     six_months_ago = today - timedelta(days=182)
     week_start = today - timedelta(days=today.weekday())
 
-    # Leads
-    total_leads = (await db.execute(select(func.count(Lead.id)))).scalar_one()
-    new_leads = (await db.execute(
-        select(func.count(Lead.id)).where(Lead.created_at >= month_start)
-    )).scalar_one()
+    # Every single-value aggregate on this page, in ONE round trip.
+    #
+    # These were eleven separate `await db.execute(...)` calls, each a full
+    # round trip issued strictly one after another. Against a database a few
+    # hundred milliseconds away that alone was most of the ten seconds the
+    # dashboard took to load — and it was pure latency, not work: each of
+    # these is an indexed COUNT or SUM that Postgres answers in microseconds.
+    #
+    # As scalar subqueries in a single SELECT the database does exactly the
+    # same work, and we wait for the network once instead of eleven times.
+    # The multi-row queries below genuinely return sets and stay as they are.
+    def _count(model, *where):
+        q = select(func.count(model.id))
+        return (q.where(*where) if where else q).scalar_subquery()
 
-    # Clients
-    active_clients = (await db.execute(
-        select(func.count(Client.id)).where(Client.status != ClientStatus.COMPLETED_PROGRAM)
-    )).scalar_one()
-    new_clients = (await db.execute(
-        select(func.count(Client.id)).where(Client.created_at >= thirty_days_ago)
-    )).scalar_one()
+    def _sum(column, *where):
+        q = select(func.coalesce(func.sum(column), 0))
+        return (q.where(*where) if where else q).scalar_subquery()
 
-    # Follow-ups
-    pending_follow_ups = (await db.execute(
-        select(func.count(FollowUp.id)).where(
-            FollowUp.due_date >= today, FollowUp.completed_at.is_(None)
-        )
-    )).scalar_one()
+    totals = (await db.execute(select(
+        _count(Lead).label("total_leads"),
+        _count(Lead, Lead.created_at >= month_start).label("new_leads"),
+        _count(Client, Client.status != ClientStatus.COMPLETED_PROGRAM).label("active_clients"),
+        _count(Client, Client.created_at >= thirty_days_ago).label("new_clients"),
+        _count(FollowUp, FollowUp.due_date >= today,
+               FollowUp.completed_at.is_(None)).label("pending_follow_ups"),
+        _count(SessionModel, SessionModel.date == today).label("sessions_today"),
+        _count(SessionModel, SessionModel.status == SessionStatus.SCHEDULED,
+               SessionModel.date >= today).label("upcoming"),
+        _sum(Enrollment.package_price_snapshot).label("revenue_totals"),
+        _sum(Payment.amount_paid).label("collected"),
+        _sum(Enrollment.amount_due,
+             Enrollment.status == EnrollmentStatus.ACTIVE).label("pending_payments"),
+        _sum(Payment.amount_paid, Payment.date >= month_start).label("monthly_revenue"),
+    ))).one()
 
-    # Sessions today
-    sessions_today = (await db.execute(
-        select(func.count(SessionModel.id)).where(SessionModel.date == today)
-    )).scalar_one()
+    total_leads = totals.total_leads
+    new_leads = totals.new_leads
+    active_clients = totals.active_clients
+    new_clients = totals.new_clients
+    pending_follow_ups = totals.pending_follow_ups
+    sessions_today = totals.sessions_today
 
     # Session metrics — one grouped query for status counts, one for "today"/"upcoming" special cases
     status_count_rows = (await db.execute(
@@ -68,11 +85,7 @@ async def get_dashboard(
     )).all()
     status_counts = {row[0]: row[1] for row in status_count_rows}
     total_sessions = sum(status_counts.values())
-    upcoming = (await db.execute(
-        select(func.count(SessionModel.id)).where(
-            SessionModel.status == SessionStatus.SCHEDULED, SessionModel.date >= today
-        )
-    )).scalar_one()
+    upcoming = totals.upcoming
 
     session_metrics = SessionMetrics(
         total=total_sessions,
@@ -87,21 +100,9 @@ async def get_dashboard(
     # enrollment ever started (active + completed); collected is actual cash
     # taken in via the payments ledger. Neither figure lives on a single row
     # anymore now that "due" isn't stored per-payment — see Enrollment.
-    revenue_totals = (await db.execute(
-        select(func.coalesce(func.sum(Enrollment.package_price_snapshot), 0))
-    )).scalar_one()
-    total_revenue = Decimal(str(revenue_totals))
-
-    collected = (await db.execute(
-        select(func.coalesce(func.sum(Payment.amount_paid), 0))
-    )).scalar_one()
-    collected = Decimal(str(collected))
-
-    pending_payments = (await db.execute(
-        select(func.coalesce(func.sum(Enrollment.amount_due), 0))
-        .where(Enrollment.status == EnrollmentStatus.ACTIVE)
-    )).scalar_one()
-    pending_payments = Decimal(str(pending_payments))
+    total_revenue = Decimal(str(totals.revenue_totals))
+    collected = Decimal(str(totals.collected))
+    pending_payments = Decimal(str(totals.pending_payments))
 
     # Quantize to cents — an unrounded Decimal division serialises as a
     # 24-decimal-place string in the JSON response.
@@ -110,11 +111,7 @@ async def get_dashboard(
         if active_clients else Decimal("0.00")
     )
 
-    monthly_revenue = (await db.execute(
-        select(func.coalesce(func.sum(Payment.amount_paid), 0))
-        .where(Payment.date >= month_start)
-    )).scalar_one()
-    monthly_revenue = Decimal(str(monthly_revenue))
+    monthly_revenue = Decimal(str(totals.monthly_revenue))
 
     revenue_metrics = RevenueMetrics(
         total_revenue=total_revenue,

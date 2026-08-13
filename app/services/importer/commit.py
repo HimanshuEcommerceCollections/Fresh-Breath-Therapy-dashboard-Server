@@ -1088,10 +1088,34 @@ async def rollback_batch(db: AsyncSession, batch: ImportBatch) -> dict:
             )
             accruals_withdrawn = result.rowcount or 0
 
+    # Load every affected record in ONE query, not one per row.
+    #
+    # This was `await db.get(...)` inside the loop below — a SELECT per row,
+    # issued sequentially. Undoing a 546-row leads import therefore made 546
+    # round trips before it deleted anything, and at ~500ms to the database
+    # that is four to five minutes during which the request simply hangs: no
+    # error, no success, exactly what the rollback button was doing.
+    #
+    # Objects are still deleted through the ORM below rather than by a bulk
+    # DELETE, so relationship cascades behave exactly as before. Only the
+    # reading is batched.
+    objects: dict[uuid.UUID, object] = {}
+    entity_ids = [row.entity_id for row in rows if row.entity_id is not None]
+    if entity_ids:
+        # Chunked against the 65,535 bind-parameter ceiling, same rule the
+        # commit path uses. One parameter per id, so this is generous.
+        for start in range(0, len(entity_ids), 10_000):
+            found = (await db.execute(
+                select(entity.model).where(
+                    entity.model.id.in_(entity_ids[start:start + 10_000])
+                )
+            )).scalars().all()
+            objects.update({obj.id: obj for obj in found})
+
     for row in rows:
         if row.entity_id is None:
             continue
-        obj = await db.get(entity.model, row.entity_id)
+        obj = objects.get(row.entity_id)
         if obj is None:
             continue
 
