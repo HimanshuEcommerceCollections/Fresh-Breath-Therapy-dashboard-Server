@@ -13,7 +13,15 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_SECRET: str | None = None
     GOOGLE_REDIRECT_URI: str = "https://fresh-breath-therapy-dashboard-serv.vercel.app/api/auth/google/callback"
     FRONTEND_URL: str = "https://fresh-breath-therapy-dashboard-ui.vercel.app"
-    ALLOWED_ORIGINS: str = "http://localhost:3000,https://fresh-breath-therapy-dashboard-ui.vercel.app"
+    # Exact origins, never a wildcard: allow_credentials=True is set in
+    # main.py, and the CORS spec forbids "*" alongside credentials — the
+    # browser rejects the response rather than the server. So every port the
+    # frontend might run on has to be listed. 3001 is what Next.js falls back
+    # to when 3000 is already taken.
+    ALLOWED_ORIGINS: str = (
+        "http://localhost:3000,http://localhost:3001,"
+        "https://fresh-breath-therapy-dashboard-ui.vercel.app"
+    )
     SMTP_HOST: str = "smtp.gmail.com"
     SMTP_PORT: int = 587
     SMTP_USER: str | None = None
