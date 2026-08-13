@@ -2,10 +2,11 @@ import uuid
 from fastapi import Depends, HTTPException, status
 from fastapi.security import APIKeyCookie
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from sqlalchemy.orm import selectinload
+from sqlalchemy import literal, select
+from sqlalchemy.orm import joinedload, selectinload
 
 from app.database import get_db
+from app.models.revoked_token import RevokedToken
 from app.models.user import User
 from app.models.therapist import Therapist
 from app.services.jwt_service import decode_token_claims
@@ -25,21 +26,41 @@ async def get_current_user(
     if claims is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
 
-    # A logged-out token is rejected here even if it's still unexpired and
-    # someone else still has a copy of it — see token_revocation_service.
     jti = claims.get("jti")
-    if jti and await is_token_revoked(db, jti):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
-
     try:
         user_id = uuid.UUID(claims["sub"])
     except (KeyError, ValueError):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
 
-    result = await db.execute(
-        select(User).options(selectinload(User.role)).where(User.id == user_id)
+    # One round trip for the whole dependency, not three.
+    #
+    # Every authenticated request pays this, so its cost is a floor under the
+    # entire API. It used to be three sequential queries — the revoked-token
+    # check, the user, then the role via selectinload — and against a database
+    # a few hundred milliseconds away that was most of the ~2s that even
+    # GET /api/auth/me was taking.
+    #
+    # joinedload rather than selectinload: role is a many-to-one, so it is a
+    # single LEFT JOIN with no second SELECT. The revocation check rides along
+    # as a correlated EXISTS, which is free on an indexed primary key and
+    # cannot be a separate round trip.
+    #
+    # A logged-out token is still rejected even if unexpired and someone else
+    # holds a copy — see token_revocation_service.
+    revoked = (
+        select(RevokedToken.jti).where(RevokedToken.jti == jti).exists()
+        if jti else literal(False)
     )
-    user = result.scalar_one_or_none()
+    row = (await db.execute(
+        select(User, revoked.label("is_revoked"))
+        .options(joinedload(User.role))
+        .where(User.id == user_id)
+    )).first()
+
+    if row is not None and row.is_revoked:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
+
+    user = row[0] if row is not None else None
 
     if user is None or not user.is_active:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
