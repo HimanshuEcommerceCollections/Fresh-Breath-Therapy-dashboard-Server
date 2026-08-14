@@ -3,7 +3,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import Date, cast, func, select
 from app.database import get_db
 from app.models.lead import Lead
 from app.models.client import Client
@@ -200,35 +200,61 @@ async def retention_by_location_report(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_admin_or_coordinator()),
 ):
-    locations = (await db.execute(select(Location.id, Location.name))).all()
+    # One query for the whole report.
+    #
+    # This was a nested N+1: one query for the locations, then one per location
+    # for its clients, then ONE PER CLIENT for that client's last session. At
+    # FBT's size — 150-odd locations and 250 clients — that is roughly 400
+    # queries issued strictly one after another, and against a database a few
+    # hundred milliseconds away it is minutes of pure waiting. The chart did
+    # not so much load slowly as never arrive.
+    #
+    # The arithmetic is unchanged and deliberately mirrors the old loop:
+    #   * a client's span runs from created_at to their LAST session date,
+    #   * a client with no sessions yet is measured to today instead,
+    #   * a negative span (a session dated before the client record) clamps
+    #     to zero rather than subtracting from the location's average,
+    #   * days are divided by 30, and the mean is taken over every client at
+    #     the location — including those contributing zero.
+    # A location with no clients averages to NULL and is reported as 0.0,
+    # exactly as the `if not clients` branch did.
+    last_session = (
+        select(
+            SessionModel.client_id.label("client_id"),
+            func.max(SessionModel.date).label("last_date"),
+        )
+        .group_by(SessionModel.client_id)
+        .subquery()
+    )
 
-    points = []
-    for location_id, location_name in locations:
-        clients = (
-            await db.execute(
-                select(Client.id, Client.created_at).where(Client.location_id == location_id)
-            )
-        ).all()
+    # date - date is an integer number of days in Postgres, so this stays in
+    # exact arithmetic until the final division.
+    span_days = func.greatest(
+        func.coalesce(last_session.c.last_date, func.current_date())
+        - cast(Client.created_at, Date),
+        0,
+    )
 
-        if not clients:
-            points.append(RetentionPoint(location_id=location_id, location_name=location_name, retention_months=0.0))
-            continue
+    rows = (await db.execute(
+        select(
+            Location.id,
+            Location.name,
+            func.coalesce(func.avg(span_days / 30.0), 0).label("retention_months"),
+        )
+        .select_from(Location)
+        .outerjoin(Client, Client.location_id == Location.id)
+        .outerjoin(last_session, last_session.c.client_id == Client.id)
+        .group_by(Location.id, Location.name)
+    )).all()
 
-        total_months = 0.0
-        for client_id, created_at in clients:
-            last_session = (
-                await db.execute(
-                    select(func.max(SessionModel.date)).where(SessionModel.client_id == client_id)
-                )
-            ).scalar_one()
-            end_date = last_session or date.today()
-            months = max((end_date - created_at.date()).days / 30, 0)
-            total_months += months
-
-        points.append(RetentionPoint(
+    # Rounded in Python, not in SQL: round() and Postgres' ROUND() disagree on
+    # halfway values, and this figure is compared against the previous
+    # implementation.
+    return [
+        RetentionPoint(
             location_id=location_id,
             location_name=location_name,
-            retention_months=round(total_months / len(clients), 1),
-        ))
-
-    return points
+            retention_months=round(float(retention_months), 1),
+        )
+        for location_id, location_name, retention_months in rows
+    ]
