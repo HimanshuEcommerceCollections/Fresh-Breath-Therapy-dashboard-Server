@@ -6,6 +6,18 @@ class Settings(BaseSettings):
     SECRET_KEY: str
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    # Which deployment this process is. Defaults to the LOCKED-DOWN value on
+    # purpose, which is the opposite of how these flags usually read.
+    #
+    # A permissive default means every environment that forgets to set the
+    # variable is exposed, and the mistake is invisible until someone finds
+    # it. Defaulting to "production" inverts the failure mode: forget it on a
+    # new deploy and you are safe, forget it locally and you merely lose
+    # /docs. Local development opts IN via ENVIRONMENT=development in .env.
+    #
+    # Anything other than exactly "development" is treated as production —
+    # a typo must not silently unlock things.
+    ENVIRONMENT: str = "production"
     CLOUDINARY_CLOUD_NAME: str | None = None
     CLOUDINARY_API_KEY: str | None = None
     CLOUDINARY_API_SECRET: str | None = None
@@ -101,6 +113,17 @@ class Settings(BaseSettings):
     def _with_port(url: str, port: int) -> str:
         """Swap the port in a postgres URL, leaving credentials untouched."""
         return re.sub(r"(?<=:)\d+(?=/[^/]*$)", str(port), url, count=1)
+
+    @property
+    def is_development(self) -> bool:
+        """True only for an explicit, exact ENVIRONMENT=development.
+
+        Case-insensitive and whitespace-tolerant so a stray space in a
+        dashboard env var doesn't flip a deployment into dev mode, but
+        deliberately not fuzzy beyond that: "dev", "local" and "staging" are
+        all production as far as this is concerned.
+        """
+        return self.ENVIRONMENT.strip().lower() == "development"
 
     @property
     def is_supabase_pooler(self) -> bool:

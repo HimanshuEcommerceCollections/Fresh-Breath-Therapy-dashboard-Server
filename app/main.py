@@ -13,7 +13,31 @@ from app.routers import (
 )
 from app.services.scheduler_service import start_scheduler
 
-app = FastAPI(title="FBT Dashboard API")
+# ── interactive docs: development only ───────────────────────────────────
+#
+# All THREE of these have to be switched off together, and openapi_url is the
+# one that matters. /docs and /redoc are just renderers; the actual disclosure
+# is the schema document itself, which anonymously served up 135KB describing
+# 76 paths, 100 operations and 124 schemas — 44 of which name PHI fields
+# (LeadResponse alone publishes name, age, gender_or_pronoun, email, phone,
+# message). That is a machine-readable map of exactly what patient data this
+# system holds, handed to anyone who asks, before any authentication.
+#
+# It also published /api/asdv4nh45j-sdvvwe5-sd7cf8vw-dcsd/leads in full, so
+# the webhook's unguessable-looking prefix protected nothing and
+# LEAD_WEBHOOK_SECRET was doing all the work; and it enumerated the whole auth
+# surface, including the endpoints most worth attacking.
+#
+# Passing None does not hide the route behind a 403 — it is never registered,
+# so there is nothing there to probe.
+_docs_enabled = settings.is_development
+
+app = FastAPI(
+    title="FBT Dashboard API",
+    docs_url="/docs" if _docs_enabled else None,
+    redoc_url="/redoc" if _docs_enabled else None,
+    openapi_url="/openapi.json" if _docs_enabled else None,
+)
 
 allowed_origins = [origin.strip() for origin in settings.ALLOWED_ORIGINS.split(",") if origin.strip()]
 
