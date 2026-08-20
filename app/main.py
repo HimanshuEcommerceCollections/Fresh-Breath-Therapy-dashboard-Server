@@ -6,7 +6,9 @@ from app.config import settings
 from app.database import AsyncSessionLocal, log_connection_mode
 from app.middleware.cache import NoStoreCacheMiddleware
 from app.middleware.csrf import CsrfProtectionMiddleware
+from app.middleware.errors import unhandled_exception_handler
 from app.middleware.headers import SecurityHeadersMiddleware
+from app.middleware.request_id import RequestIdMiddleware
 from app.startup import ensure_auth_bootstrap
 from app.routers import (
     auth, locations, therapists, leads, clients, follow_up,
@@ -73,6 +75,16 @@ app.add_middleware(NoStoreCacheMiddleware)
 # HSTS is withheld outside production so it is never even sent during local
 # HTTP development; see app/middleware/headers.py for the rest.
 app.add_middleware(SecurityHeadersMiddleware, hsts_enabled=not settings.is_development)
+
+# Outermost of all: every response, including those produced by the middleware
+# below it, comes back with an X-Request-ID the caller can quote. Assigning the
+# id here also means it exists before anything else can reject the request.
+app.add_middleware(RequestIdMiddleware)
+
+# Registered as the handler ServerErrorMiddleware uses, so it catches anything
+# that escapes a route. Returns a request id and nothing else — see
+# app/middleware/errors.py for why str(exc) must never reach the client.
+app.add_exception_handler(Exception, unhandled_exception_handler)
 
 app.include_router(auth.router)
 app.include_router(locations.router)
