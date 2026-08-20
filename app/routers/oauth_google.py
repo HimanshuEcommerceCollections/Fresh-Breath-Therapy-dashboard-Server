@@ -14,8 +14,8 @@ from app.config import settings
 from app.models.user import User
 from app.models.role_request import RoleRequest, RoleRequestStatus
 from app.services.jwt_service import create_access_token
-from app.services.auth_cookie import set_auth_cookie
-from app.services.otp_service import request_otp
+from app.services.auth_cookie import set_auth_cookie, set_login_ticket_cookie
+from app.services.otp_service import OTP_TTL_MINUTES, request_otp
 
 logger = logging.getLogger(__name__)
 
@@ -130,13 +130,19 @@ async def google_callback(
             # redirect, so params carry what the login form would otherwise pass
             # via JSON) to finish the same verify-login-otp step password users go
             # through.
-            expires_at = await request_otp(db, user.id, user.email, purpose="login")
+            expires_at, ticket = await request_otp(db, user.id, user.email, purpose="login")
             query = urlencode({
                 "email": user.email,
                 "flow": "login",
                 "expiresAt": expires_at.isoformat(),
             })
             redirect = RedirectResponse(f"{settings.FRONTEND_URL}/verify-otp?{query}")
+            # Google asserting this identity is what earns the ticket here, in
+            # place of the password check /login does. It rides as a cookie
+            # rather than a query param for the obvious reason: this is a
+            # full-page redirect, and a ticket in the URL would be recorded in
+            # platform access logs and browser history.
+            set_login_ticket_cookie(redirect, ticket, OTP_TTL_MINUTES * 60)
             redirect.delete_cookie("oauth_state")
             return redirect
 
