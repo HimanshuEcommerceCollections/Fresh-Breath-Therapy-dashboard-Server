@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.database import AsyncSessionLocal, log_connection_mode
+from app.middleware.csrf import CsrfProtectionMiddleware
 from app.startup import ensure_auth_bootstrap
 from app.routers import (
     auth, locations, therapists, leads, clients, follow_up,
@@ -40,6 +41,17 @@ app = FastAPI(
 )
 
 allowed_origins = [origin.strip() for origin in settings.ALLOWED_ORIGINS.split(",") if origin.strip()]
+
+# ORDER MATTERS. Starlette runs the most recently added middleware outermost,
+# so CORS must be added LAST to end up wrapping the CSRF check. That way a
+# rejection from CsrfProtectionMiddleware still gets CORS headers applied on
+# the way out, and a legitimate origin that somehow trips it sees a readable
+# 403 rather than an opaque browser network error.
+#
+# Both read the SAME allowed_origins list, deliberately: CORS decides who may
+# read a response, the CSRF check decides who may cause a write, and they must
+# never disagree about which origins are ours.
+app.add_middleware(CsrfProtectionMiddleware, allowed_origins=allowed_origins)
 
 app.add_middleware(
     CORSMiddleware,
