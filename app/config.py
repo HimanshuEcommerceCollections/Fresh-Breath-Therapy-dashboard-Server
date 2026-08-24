@@ -46,6 +46,19 @@ class Settings(BaseSettings):
     # somewhere the in-process scheduler can't. No default: unset means the
     # route refuses every request rather than running unauthenticated.
     CRON_SECRET: str | None = None
+    # ── audit log retention ───────────────────────────────────────────────
+    # HIPAA 164.316(b)(2) requires documentation to be kept six years, and
+    # audit records are treated as required documentation. Configurable rather
+    # than a constant because it is a legal/business call, not a code one —
+    # state law or an insurer may require longer, and the Settings screen
+    # currently claims seven.
+    AUDIT_RETENTION_DAYS: int = 6 * 365
+    # The purge is the only path that deletes audit rows. On by default and a
+    # no-op for six years; leaving the MECHANISM unbuilt is how this codebase
+    # ended up with three tables carrying TODO(retention) and nowhere to hang a
+    # policy.
+    AUDIT_PURGE_ENABLED: bool = True
+
     # ── pooling ───────────────────────────────────────────────────────────
     # Supabase exposes the same database three ways, and which one you use
     # decides how many clients you get:

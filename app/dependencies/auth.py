@@ -9,6 +9,7 @@ from app.database import get_db
 from app.models.revoked_token import RevokedToken
 from app.models.user import User
 from app.models.therapist import Therapist
+from app.services.audit_context import set_actor
 from app.services.jwt_service import decode_token_claims
 from app.services.token_revocation_service import is_token_revoked
 
@@ -67,6 +68,12 @@ async def get_current_user(
 
     if user.role_id is None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account pending admin approval")
+
+    # Every authenticated request passes through here, so this is the one place
+    # the audit layer needs to learn who is acting — no route has to remember.
+    # The role is snapshot alongside the id because it is what an investigator
+    # asks about and it may since have changed.
+    set_actor(user.id, user.role.name if user.role else None, user.name)
 
     return user
 

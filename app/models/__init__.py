@@ -19,3 +19,4 @@ from app.models.notification import Notification
 from app.models.client_message import ClientMessage
 from app.models.revoked_token import RevokedToken
 from app.models.import_batch import ImportBatch, ImportRow
+from app.models.audit_log import AuditLog, AuditAction, AuditOutcome

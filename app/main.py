@@ -2,14 +2,21 @@ from dotenv import load_dotenv
 load_dotenv()
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from app.config import settings
 from app.database import AsyncSessionLocal, log_connection_mode
+from app.middleware.audit_context import AuditContextMiddleware
 from app.middleware.cache import NoStoreCacheMiddleware
 from app.middleware.csrf import CsrfProtectionMiddleware
-from app.middleware.errors import unhandled_exception_handler
+from app.middleware.errors import (
+    http_exception_audit_handler, unhandled_exception_handler,
+)
 from app.middleware.headers import SecurityHeadersMiddleware
 from app.middleware.request_id import RequestIdMiddleware
 from app.startup import ensure_auth_bootstrap
+# Imported for its side effect: this is what registers the before_flush hook
+# that turns every ORM write into an audit record.
+from app.services.audit_listener import register_audit_listener
 from app.routers import (
     auth, locations, therapists, leads, clients, follow_up,
     organization, roles, packages, feature_flags,
@@ -57,6 +64,11 @@ allowed_origins = [origin.strip() for origin in settings.ALLOWED_ORIGINS.split("
 # never disagree about which origins are ours.
 app.add_middleware(CsrfProtectionMiddleware, allowed_origins=allowed_origins)
 
+# WRAPS the CSRF check (registered after it, so it sits outside), because a
+# cross-site write attempt is itself a denied attempt worth recording and the
+# CSRF middleware needs a context to record it against.
+app.add_middleware(AuditContextMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
@@ -85,6 +97,12 @@ app.add_middleware(RequestIdMiddleware)
 # that escapes a route. Returns a request id and nothing else — see
 # app/middleware/errors.py for why str(exc) must never reach the client.
 app.add_exception_handler(Exception, unhandled_exception_handler)
+
+# Records 401/403 as denied attempts (audit item 3.5) and then answers exactly
+# as FastAPI would have; the client sees no difference.
+app.add_exception_handler(StarletteHTTPException, http_exception_audit_handler)
+
+register_audit_listener()
 
 app.include_router(auth.router)
 app.include_router(locations.router)
