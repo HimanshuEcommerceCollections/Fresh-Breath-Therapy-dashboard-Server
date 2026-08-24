@@ -89,6 +89,17 @@ class Settings(BaseSettings):
     # policy.
     AUDIT_PURGE_ENABLED: bool = True
 
+    # ── retention for the other PHI-bearing tables (item 5.7) ─────────────
+    # How long after a batch settles the spreadsheet's raw contents are kept.
+    # Long enough to investigate a bad import, short enough that years of other
+    # people's spreadsheets do not sit in the database. The row's verdict and
+    # the id it produced are kept regardless — only the PHI columns are nulled.
+    IMPORT_ROW_RETENTION_DAYS: int = 30
+    # Stored API responses exist to make a retried request safe, which is
+    # answered within seconds. Stripe keeps theirs 24 hours; anything longer is
+    # a copy of a client record for no reason.
+    IDEMPOTENCY_KEY_RETENTION_HOURS: int = 24
+
     # ── pooling ───────────────────────────────────────────────────────────
     # Supabase exposes the same database three ways, and which one you use
     # decides how many clients you get:

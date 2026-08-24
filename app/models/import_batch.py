@@ -186,10 +186,11 @@ class ImportBatch(Base):
 class ImportRow(Base):
     """One spreadsheet row, its verdict, and what it produced.
 
-    TODO(retention): raw_payload contains PHI. Rows should be purged (or
-    raw_payload nulled, keeping the verdict for audit) some fixed period
-    after the batch commits. Wire this into scheduler_service.py alongside
-    the existing scans once the retention window is agreed with FBT.
+    RETENTION: raw_payload contains PHI, and is redacted in place
+    IMPORT_ROW_RETENTION_DAYS after the batch settles — see
+    services/retention_service.py, run daily from scheduler_service.py. The
+    row_number, status, errors and entity_id survive redaction, because those
+    are what make an import explainable afterwards and what a rollback walks.
     """
 
     __tablename__ = "import_rows"

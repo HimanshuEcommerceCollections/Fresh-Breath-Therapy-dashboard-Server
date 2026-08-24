@@ -8,6 +8,7 @@ from app.models.enums import SessionStatus
 from app.services.notification_service import create_notification
 from app.services.audit_context import install_context, reset_context, system_context
 from app.services.audit_service import purge_expired, record_read
+from app.services.retention_service import run_retention_sweep
 from app.config import settings
 from app.models.notification import NotificationCategory, NotificationBadge
 from app.models.client import Client
@@ -130,6 +131,22 @@ async def run_audit_retention() -> int:
         reset_context(token)
 
 
+async def run_data_retention() -> dict:
+    """Enforce retention on the other PHI-bearing tables (item 5.7).
+
+    Separate from the audit purge because they answer to different windows and
+    different rules — audit rows are kept for six years and then deleted, while
+    import rows are redacted in place after thirty days so the import stays
+    explainable. Sharing the same system identity so both are attributable.
+    """
+    token = install_context(system_context("system:retention"))
+    try:
+        async with AsyncSessionLocal() as db:
+            return await run_retention_sweep(db)
+    finally:
+        reset_context(token)
+
+
 def start_scheduler() -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler()
     scheduler.add_job(run_notification_scan, "interval", minutes=15, id="notification_scan")
@@ -137,5 +154,6 @@ def start_scheduler() -> AsyncIOScheduler:
     # over an indexed created_at range is cheap enough that frequency buys
     # nothing.
     scheduler.add_job(run_audit_retention, "interval", hours=24, id="audit_retention")
+    scheduler.add_job(run_data_retention, "interval", hours=24, id="data_retention")
     scheduler.start()
     return scheduler
