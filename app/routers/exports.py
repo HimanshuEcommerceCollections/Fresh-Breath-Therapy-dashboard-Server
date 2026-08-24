@@ -19,6 +19,7 @@ from app.models.enrollment import Enrollment
 from app.models.enums import PaymentStatus
 from app.models.user import User
 from app.dependencies.auth import require_admin_or_coordinator
+from app.services.audit_service import record_export
 from app.routers import reports as reports_router
 from app.routers.enrollments import _enrollment_query, _payment_status_filter
 from app.services.export_service import (
@@ -135,6 +136,14 @@ async def export_report(
             bits.append("filtered by location")
         body = to_pdf(title, " · ".join(bits), headers, _fmt_for_pdf(rows))
 
+    # Item 3.6 asks specifically for row count AND filter criteria, so that
+    # "148 rows" is always explainable after the fact.
+    await record_export(
+        db, "report",
+        count=len(rows),
+        criteria={"report": name, "format": format, "range": range,
+                  "location_id": str(location_id) if location_id else None},
+    )
     fname = filename_for(f"fbt-{name}-report", format)
     return Response(
         content=body,
@@ -187,6 +196,16 @@ async def export_payments(
             headers, _fmt_for_pdf(rows),
         )
 
+    # Deliberately unbounded (see the docstring), so this is the single
+    # largest PHI extraction the API offers and the ids are worth keeping.
+    await record_export(
+        db, "enrollment",
+        count=len(invoices),
+        entity_ids=[e.id for e in invoices],
+        criteria={"format": format,
+                  "payment_status": payment_status.value if payment_status else None,
+                  "client_id": str(client_id) if client_id else None},
+    )
     fname = filename_for("fbt-payments", format)
     return Response(
         content=body,

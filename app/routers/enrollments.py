@@ -7,6 +7,7 @@ from sqlalchemy import select, and_, or_
 from sqlalchemy.orm import selectinload
 
 from app.database import get_db
+from app.services.audit_service import record_read
 from app.models.enrollment import Enrollment
 from app.models.payment import Payment
 from app.models.client import Client
@@ -85,6 +86,11 @@ async def list_enrollments(
     query = apply_keyset_pagination(query, Enrollment, cursor, limit)
     result = await db.execute(query)
     items, next_cursor, has_more = paginate_rows(result.scalars().all(), limit)
+    await record_read(
+        db, "enrollment",
+        entity_ids=[i.id for i in items],
+        criteria={"limit": limit, "paged": bool(cursor)},
+    )
     return Page(items=items, next_cursor=next_cursor, has_more=has_more)
 
 

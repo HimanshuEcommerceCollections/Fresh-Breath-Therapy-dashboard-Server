@@ -28,6 +28,8 @@ from app.services.auth_cookie import (
     ACCESS_TOKEN_COOKIE, LOGIN_TICKET_COOKIE, clear_auth_cookie,
     clear_login_ticket_cookie, set_auth_cookie, set_login_ticket_cookie,
 )
+from app.services.audit_service import record_login, record_logout
+from app.services.jwt_service import decode_token_claims
 from app.services.token_revocation_service import revoke_token
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -83,9 +85,17 @@ async def login(
     user = result.scalar_one_or_none()
 
     if user is None or user.password_hash is None:
+        # Only the DOMAIN is recorded, never the address. The address behind a
+        # failed attempt is the one field that would make this table useful to
+        # whoever reached it; the domain still distinguishes "someone is
+        # spraying our staff" from "one person mistyped".
+        await record_login(db, user.id if user else None, success=False,
+                           email_domain=credentials.email.rsplit("@", 1)[-1])
         raise HTTPException(status_code=401, detail="Please sign in with Google for this account")
 
     if not verify_password(credentials.password, user.password_hash):
+        await record_login(db, user.id, success=False,
+                           email_domain=credentials.email.rsplit("@", 1)[-1])
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
 
     if user.role_id is None:
@@ -98,6 +108,7 @@ async def login(
         # this is the only place a session can be minted. No ticket is issued,
         # which is precisely why /verify-login-otp cannot mint one either.
         _set_access_token_cookie(response, user.id)
+        await record_login(db, user.id, success=True)
         return OtpRequestResponse(detail="Login successful", otp_required=False)
 
     # The password verified above is what earns the ticket. Everything the OTP
@@ -141,6 +152,7 @@ async def verify_login_otp(
     # browser afterwards.
     clear_login_ticket_cookie(response)
     _set_access_token_cookie(response, user.id)
+    await record_login(db, user.id, success=True)
     # The user rides back with the verification so the client can populate its
     # session cache and route straight to the dashboard. An account with no
     # role yet is still pending approval, so there is nothing useful to send.
@@ -207,6 +219,12 @@ async def logout(request: Request, response: Response, db: AsyncSession = Depend
     token = request.cookies.get(ACCESS_TOKEN_COOKIE)
     if token:
         await revoke_token(db, token)
+    claims = decode_token_claims(token) if token else None
+    try:
+        user_id = uuid.UUID(claims["sub"]) if claims and claims.get("sub") else None
+    except (KeyError, ValueError):
+        user_id = None
+    await record_logout(db, user_id)
     clear_auth_cookie(response)
     return {"detail": "Logged out"}
 

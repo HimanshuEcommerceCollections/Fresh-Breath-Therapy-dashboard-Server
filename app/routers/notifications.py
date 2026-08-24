@@ -9,6 +9,7 @@ from app.models.notification import Notification, NotificationCategory, Notifica
 from app.models.user import User
 from app.models.therapist import Therapist
 from app.dependencies.auth import get_current_user, get_own_therapist
+from app.services.audit_service import record_read
 from app.schemas.notification import NotificationResponse, NotificationSummaryResponse, NotificationTab
 
 router = APIRouter(prefix="/api/notifications", tags=["notifications"])
@@ -48,7 +49,16 @@ async def list_notifications(
         query = query.where(Notification.badge.in_(ALERT_BADGES))
 
     result = await db.execute(query.order_by(Notification.created_at.desc()))
-    return result.scalars().all()
+    items = result.scalars().all()
+    # These are PHI reads, not housekeeping: notification bodies embed client
+    # and lead names (scheduler_service.py, webhooks.py), and an unassigned
+    # notification is visible to every therapist.
+    await record_read(
+        db, "notification",
+        entity_ids=[i.id for i in items],
+        criteria={"tab": tab.value},
+    )
+    return items
 
 
 @router.get("/summary", response_model=NotificationSummaryResponse)

@@ -17,6 +17,7 @@ from app.schemas.enrollment import EnrollmentResponse
 from app.models.user import User
 from app.dependencies.auth import require_admin, require_admin_or_coordinator
 from app.dependencies.idempotency import idempotent
+from app.services.audit_service import record_read
 from app.services.pagination import Page, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, apply_keyset_pagination, paginate_rows
 
 router = APIRouter(prefix="/api/payments", tags=["payments"])
@@ -45,6 +46,15 @@ async def list_payments(
     query = apply_keyset_pagination(query, Payment, cursor, limit)
     result = await db.execute(query)
     items, next_cursor, has_more = paginate_rows(result.scalars().all(), limit)
+    await record_read(
+        db, "payment",
+        entity_ids=[i.id for i in items],
+        criteria={
+            "client_id": str(client_id) if client_id else None,
+            "enrollment_id": str(enrollment_id) if enrollment_id else None,
+            "limit": limit, "paged": bool(cursor),
+        },
+    )
     return Page(items=items, next_cursor=next_cursor, has_more=has_more)
 
 
@@ -58,6 +68,7 @@ async def get_payment(
     payment = result.scalar_one_or_none()
     if payment is None:
         raise HTTPException(status_code=404, detail="Payment not found")
+    await record_read(db, "payment", entity_id=payment.id)
     return payment
 
 

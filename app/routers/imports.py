@@ -32,6 +32,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.services.audit_service import record_read
 from app.dependencies.auth import require_admin
 from app.models.import_batch import (
     ImportBatch, ImportRow, ImportRowStatus, ImportStatus,
@@ -453,6 +454,10 @@ async def get_import(
     current_user: User = Depends(require_admin()),
 ):
     batch = await _get_batch(db, batch_id)
+    # The detail payload carries per-column SAMPLE VALUES lifted from the
+    # sheet, so this is a PHI read and not just metadata.
+    await record_read(db, "import_batch", entity_id=batch.id,
+                      criteria={"view": "detail"})
     return await _batch_detail(db, batch)
 
 
@@ -479,7 +484,7 @@ async def list_batch_rows(
         query = query.where(ImportRow.status.in_(wanted))
 
     result = await db.execute(query.order_by(ImportRow.row_number).limit(limit))
-    return [
+    previews = [
         RowPreview(
             row_number=row.row_number,
             status=row.status,
@@ -492,6 +497,14 @@ async def list_batch_rows(
         )
         for row in result.scalars().all()
     ]
+    # Every cell of the uploaded spreadsheet, verbatim — the least filtered
+    # PHI this API returns anywhere.
+    await record_read(
+        db, "import_row", entity_id=batch_id,
+        count=len(previews),
+        criteria={"view": "rows", "batch_id": str(batch_id)},
+    )
+    return previews
 
 
 @router.patch("/{batch_id}/mapping", response_model=ImportBatchDetail)
@@ -1297,7 +1310,13 @@ async def list_imports(
     if entity:
         query = query.where(ImportBatch.entity == entity)
     result = await db.execute(query)
-    return list(result.scalars().all())
+    batches = list(result.scalars().all())
+    await record_read(
+        db, "import_batch",
+        entity_ids=[b.id for b in batches],
+        criteria={"entity": entity, "limit": limit},
+    )
+    return batches
 
 
 @router.delete("/{batch_id}", status_code=status.HTTP_204_NO_CONTENT)

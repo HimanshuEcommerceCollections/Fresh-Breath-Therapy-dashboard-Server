@@ -18,6 +18,7 @@ from app.schemas.follow_up import (
 from app.models.user import User
 from app.models.therapist import Therapist
 from app.dependencies.auth import get_current_user, require_admin, get_own_therapist
+from app.services.audit_service import record_denied_on, record_read
 from app.services.pagination import Page, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, apply_keyset_pagination, paginate_rows
 
 router = APIRouter(prefix="/api/follow-ups", tags=["follow-ups"])
@@ -73,6 +74,11 @@ async def list_follow_ups(
     result = await db.execute(query)
     follow_ups, next_cursor, has_more = paginate_rows(result.scalars().all(), limit)
     responses = [_to_response(f) for f in follow_ups]
+    await record_read(
+        db, "follow_up",
+        entity_ids=[f.id for f in follow_ups],
+        criteria={"limit": limit, "paged": bool(cursor)},
+    )
     return Page(items=responses, next_cursor=next_cursor, has_more=has_more)
 
 
@@ -113,7 +119,9 @@ async def get_follow_up(
     if current_user.role.name == "Therapist":
         client = await db.get(Client, follow_up.client_id)
         if client is None or client.therapist_id != own_therapist.id:
+            await record_denied_on(db, "follow_up", entity_id=follow_up_id)
             raise HTTPException(status_code=404, detail="Follow-up not found")
+    await record_read(db, "follow_up", entity_id=follow_up.id)
     return _to_response(follow_up)
 
 

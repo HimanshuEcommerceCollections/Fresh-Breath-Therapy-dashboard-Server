@@ -14,6 +14,7 @@ from app.schemas.lead import LeadCreate, LeadUpdate, LeadResponse
 from app.schemas.client import ClientResponse
 from app.models.user import User
 from app.dependencies.auth import get_current_user, require_admin, get_own_therapist
+from app.services.audit_service import record_denied_on, record_read
 from app.dependencies.idempotency import idempotent
 from app.services.pagination import Page, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, apply_keyset_pagination, paginate_rows
 from app.routers.clients import _client_query, _attach_computed_fields
@@ -58,6 +59,18 @@ async def list_leads(
     query = apply_keyset_pagination(query, Lead, cursor, limit)
     result = await db.execute(query)
     items, next_cursor, has_more = paginate_rows(result.scalars().all(), limit)
+    await record_read(
+        db, "lead",
+        entity_ids=[i.id for i in items],
+        criteria={
+            "status": status_filter.value if status_filter else None,
+            "location_id": str(location_id) if location_id else None,
+            # Lead search also matches phone, so the term is doubly PHI.
+            "searched": bool(search),
+            "limit": limit,
+            "paged": bool(cursor),
+        },
+    )
     return Page(items=items, next_cursor=next_cursor, has_more=has_more)
 
 
@@ -73,7 +86,9 @@ async def get_lead(
     if lead is None:
         raise HTTPException(status_code=404, detail="Lead not found")
     if current_user.role.name == "Therapist" and lead.therapist_id != own_therapist.id:
+        await record_denied_on(db, "lead", entity_id=lead_id)
         raise HTTPException(status_code=404, detail="Lead not found")
+    await record_read(db, "lead", entity_id=lead.id)
     return lead
 
 

@@ -18,6 +18,7 @@ from app.dependencies.auth import get_current_user, require_admin, get_own_thera
 from app.services.session_service import check_double_booking
 from app.services.pto_service import accrue_pto_for_completed_session
 from app.dependencies.idempotency import idempotent
+from app.services.audit_service import record_denied_on, record_read
 from app.services.pagination import Page, MAX_PAGE_SIZE, apply_keyset_pagination, paginate_rows
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
@@ -75,6 +76,23 @@ async def search_sessions(
     query = apply_keyset_pagination(query, Session, payload.cursor, limit)
     result = await db.execute(query)
     items, next_cursor, has_more = paginate_rows(result.scalars().all(), limit)
+    # A POST that reads. Audited as a read regardless of verb — what matters is
+    # that client records were returned, not which HTTP method asked.
+    await record_read(
+        db, "session",
+        entity_ids=[i.id for i in items],
+        criteria={
+            "status": payload.status.value if payload.status else None,
+            "client_id": str(payload.client_id) if payload.client_id else None,
+            "therapist_ids": [str(t) for t in (payload.therapist_ids or [])] or None,
+            "date_from": payload.date_from.isoformat() if payload.date_from else None,
+            "date_to": payload.date_to.isoformat() if payload.date_to else None,
+            # Matches client and therapist names, so the term itself is PHI.
+            "searched": bool(payload.search and payload.search.strip()),
+            "limit": limit,
+            "paged": bool(payload.cursor),
+        },
+    )
     return Page(items=items, next_cursor=next_cursor, has_more=has_more)
 
 
@@ -92,8 +110,10 @@ async def get_session(
 
     if current_user.role.name == "Therapist":
         if own_therapist is None or session.therapist_id != own_therapist.id:
+            await record_denied_on(db, "session", entity_id=session_id)
             raise HTTPException(status_code=404, detail="Session not found")
 
+    await record_read(db, "session", entity_id=session.id)
     return session
 
 

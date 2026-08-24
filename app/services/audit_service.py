@@ -149,6 +149,29 @@ async def record_event(
         await db.commit()
 
 
+async def record_denied_on(
+    db: AsyncSession,
+    entity_type: str,
+    *,
+    entity_id: uuid.UUID | None = None,
+    status_code: int = 404,
+) -> None:
+    """A refusal recorded on the request's own session, before it raises.
+
+    Exists for the ownership checks. A therapist asking for a client outside
+    their caseload gets a 404 — deliberately, so the response does not confirm
+    the record exists — but a 404 is indistinguishable from "no such id" to the
+    exception handler, which therefore cannot log it. Recording it here is what
+    makes "someone went looking outside their caseload" visible, and that is
+    the single most useful insider signal the log can carry.
+    """
+    db.add(build_entry(
+        AuditAction.ACCESS_DENIED, entity_type,
+        entity_id=entity_id, outcome=AuditOutcome.DENIED, status_code=status_code,
+    ))
+    await db.commit()
+
+
 async def record_denied(
     entity_type: str,
     status_code: int,
@@ -182,6 +205,22 @@ async def record_login(
         outcome=AuditOutcome.SUCCESS if success else AuditOutcome.DENIED,
         criteria={"email_domain": email_domain} if email_domain else None,
     ))
+    await db.commit()
+
+
+async def record_logout(db: AsyncSession, user_id: uuid.UUID | None) -> None:
+    """A logout.
+
+    /api/auth/logout deliberately carries no get_current_user dependency — it
+    must still clear the cookie for an expired or revoked token rather than
+    answering 401 — so there is no authenticated actor in the context. The id
+    is recovered from the token being revoked and filled in as the actor, since
+    "somebody logged out" without saying who is not worth a row.
+    """
+    ctx = current_context()
+    if ctx.actor_user_id is None:
+        ctx.actor_user_id = user_id
+    db.add(build_entry(AuditAction.LOGOUT, "user", entity_id=user_id))
     await db.commit()
 
 

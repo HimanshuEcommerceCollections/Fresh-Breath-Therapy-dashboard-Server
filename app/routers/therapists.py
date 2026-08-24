@@ -16,6 +16,7 @@ from app.models.enums import ClientStatus
 from app.schemas.therapist import TherapistCreate, TherapistUpdate, TherapistResponse
 from app.models.user import User
 from app.dependencies.auth import get_current_user, require_admin
+from app.services.audit_service import record_read
 
 router = APIRouter(prefix="/api/therapists", tags=["therapists"])
 
@@ -73,7 +74,11 @@ async def list_therapists(
         query.order_by(Therapist.is_active.desc(), Therapist.name)
     )
     therapists = result.scalars().all()
-    return await _attach_computed_fields(db, therapists)
+    responses = await _attach_computed_fields(db, therapists)
+    # Unpaginated: every therapist record in one response, so the whole staff
+    # roster is one read event.
+    await record_read(db, "therapist", entity_ids=[t.id for t in therapists])
+    return responses
 
 
 @router.get("/{therapist_id}", response_model=TherapistResponse)
@@ -89,6 +94,7 @@ async def get_therapist(
     if therapist is None:
         raise HTTPException(status_code=404, detail="Therapist not found")
     responses = await _attach_computed_fields(db, [therapist])
+    await record_read(db, "therapist", entity_id=therapist.id)
     return responses[0]
 
 

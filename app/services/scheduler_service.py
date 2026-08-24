@@ -6,6 +6,8 @@ from app.models.follow_up import FollowUp
 from app.models.session import Session as SessionModel
 from app.models.enums import SessionStatus
 from app.services.notification_service import create_notification
+from app.services.audit_context import install_context, reset_context, system_context
+from app.services.audit_service import record_read
 from app.models.notification import NotificationCategory, NotificationBadge
 from app.models.client import Client
 from zoneinfo import ZoneInfo
@@ -14,7 +16,8 @@ APPOINTMENT_LOOKAHEAD_HOURS = 2
 PAYMENT_DUE_SOON_DAYS = 3
 EASTERN = ZoneInfo("America/New_York")
 
-async def _scan_follow_ups(db):
+async def _scan_follow_ups(db) -> list:
+    read_ids = []
     today = datetime.now(EASTERN).date()
     tomorrow = today + timedelta(days=1)
 
@@ -22,6 +25,7 @@ async def _scan_follow_ups(db):
         select(FollowUp).where(FollowUp.completed_at.is_(None), FollowUp.due_date.in_([today, tomorrow]))
     )
     for fu in result.scalars().all():
+        read_ids.append(fu.id)
         client = await db.get(Client, fu.client_id)
         therapist_id = getattr(client, "therapist_id", None)
         label = "today" if fu.due_date == today else "tomorrow"
@@ -38,6 +42,7 @@ async def _scan_follow_ups(db):
         select(FollowUp).where(FollowUp.completed_at.is_(None), FollowUp.due_date < today)
     )
     for fu in result.scalars().all():
+        read_ids.append(fu.id)
         client = await db.get(Client, fu.client_id)
         therapist_id = getattr(client, "therapist_id", None)
         await create_notification(
@@ -49,8 +54,10 @@ async def _scan_follow_ups(db):
             commit=False,
         )
     await db.commit()
+    return read_ids
 
-async def _scan_sessions(db):
+async def _scan_sessions(db) -> list:
+    read_ids = []
     now = datetime.now(EASTERN)
     window_end = now + timedelta(hours=APPOINTMENT_LOOKAHEAD_HOURS)
 
@@ -58,6 +65,7 @@ async def _scan_sessions(db):
         select(SessionModel).where(SessionModel.status == SessionStatus.SCHEDULED)
     )
     for s in result.scalars().all():
+        read_ids.append(s.id)
         session_dt = datetime.combine(s.date, s.time, tzinfo=EASTERN)
         if now <= session_dt <= window_end:
             await create_notification(
@@ -69,11 +77,35 @@ async def _scan_sessions(db):
                 commit=False,
             )
     await db.commit()
+    return read_ids
 
 async def run_notification_scan():
-    async with AsyncSessionLocal() as db:
-        await _scan_follow_ups(db)
-        await _scan_sessions(db)
+    """The 15-minute reminder sweep.
+
+    Audit item 7.3: this reads every open follow-up, the client behind each one
+    and every scheduled session, on a timer, entirely outside the request and
+    auth layers. Before this it was the most regular PHI access in the system
+    and the only one with no identity attached at all — so it declares one, and
+    every audit row it causes (the notifications it writes as well as the reads
+    recorded below) is attributed to "system:scheduler" rather than to nobody.
+
+    The reads are recorded AFTER both scans finish rather than interleaved,
+    because record_read commits and doing that mid-scan would split the sweep
+    into partial transactions it was not written to tolerate.
+    """
+    token = install_context(system_context("system:scheduler"))
+    try:
+        async with AsyncSessionLocal() as db:
+            follow_up_ids = await _scan_follow_ups(db)
+            session_ids = await _scan_sessions(db)
+            if follow_up_ids:
+                await record_read(db, "follow_up", entity_ids=follow_up_ids,
+                                  criteria={"job": "notification_scan"})
+            if session_ids:
+                await record_read(db, "session", entity_ids=session_ids,
+                                  criteria={"job": "notification_scan"})
+    finally:
+        reset_context(token)
 
 def start_scheduler() -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler()
