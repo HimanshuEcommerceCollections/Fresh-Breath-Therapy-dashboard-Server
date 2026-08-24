@@ -16,7 +16,7 @@ admin reviews the result, and only then does phase two commit.
 
 `raw_payload` holds the row exactly as it appeared in the spreadsheet, which
 means this table contains PHI. It needs a retention policy; see
-TODO(retention) below.
+the RETENTION note below.
 """
 import enum
 import uuid

@@ -15,8 +15,8 @@ from app.models.pto_transaction import PtoTransaction
 from app.models.enums import ClientStatus
 from app.schemas.therapist import TherapistCreate, TherapistUpdate, TherapistResponse
 from app.models.user import User
-from app.dependencies.auth import get_current_user, require_admin
-from app.services.audit_service import record_read
+from app.dependencies.auth import get_current_user, get_own_therapist, require_admin
+from app.services.audit_service import record_denied_on, record_read
 
 router = APIRouter(prefix="/api/therapists", tags=["therapists"])
 
@@ -63,8 +63,27 @@ async def list_therapists(
     location_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    own_therapist: Therapist | None = Depends(get_own_therapist),
 ):
+    """The staff roster — scoped to the caller's own record for a Therapist.
+
+    This used to return every therapist to every role: name, email, phone,
+    credential, specialisation and employment status, to anyone who could log
+    in. Minimum necessary (item 2.3) says a therapist needs their own caseload,
+    not their colleagues' contact and employment details, and FBT confirmed
+    that reading.
+
+    Scoped rather than refused, deliberately. The sessions page builds its
+    therapist filter from this endpoint and a Therapist can reach that page, so
+    a 403 would break a screen they are entitled to use. One entry is also the
+    honest answer for them: their session list is already filtered to
+    themselves, so a filter offering anyone else was never meaningful.
+    """
     query = select(Therapist).options(selectinload(Therapist.location))
+    if current_user.role.name == "Therapist":
+        if own_therapist is None:
+            raise HTTPException(status_code=403, detail="No therapist record linked to this account")
+        query = query.where(Therapist.id == own_therapist.id)
     if location_id:
         query = query.where(Therapist.location_id == location_id)
     # Active therapists first, alphabetical within each group. An inactive
@@ -86,12 +105,22 @@ async def get_therapist(
     therapist_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    own_therapist: Therapist | None = Depends(get_own_therapist),
 ):
     result = await db.execute(
         select(Therapist).options(selectinload(Therapist.location)).where(Therapist.id == therapist_id)
     )
     therapist = result.scalar_one_or_none()
     if therapist is None:
+        raise HTTPException(status_code=404, detail="Therapist not found")
+
+    # Same shape as the client/lead/session ownership checks: 404 rather than
+    # 403, so the response does not confirm a record exists, and recorded
+    # before raising because a 404 is invisible to the exception handler.
+    if current_user.role.name == "Therapist" and (
+        own_therapist is None or therapist.id != own_therapist.id
+    ):
+        await record_denied_on(db, "therapist", entity_id=therapist_id)
         raise HTTPException(status_code=404, detail="Therapist not found")
     responses = await _attach_computed_fields(db, [therapist])
     await record_read(db, "therapist", entity_id=therapist.id)

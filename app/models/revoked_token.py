@@ -12,7 +12,8 @@ class RevokedToken(Base):
     logged out from sending it, it doesn't stop the token itself from
     working elsewhere until it naturally expires.
 
-    TODO(retention): rows only need to live until their own `expires_at` —
+    RETENTION: rows live until their own `expires_at`, then the daily sweep in
+    services/retention_service.py deletes them —
     same unaddressed cleanup gap as idempotency_keys (see that model's TODO).
     """
 
