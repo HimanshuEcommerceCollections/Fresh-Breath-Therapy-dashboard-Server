@@ -28,7 +28,9 @@ from app.services.auth_cookie import (
     ACCESS_TOKEN_COOKIE, LOGIN_TICKET_COOKIE, clear_auth_cookie,
     clear_login_ticket_cookie, set_auth_cookie, set_login_ticket_cookie,
 )
-from app.services.audit_service import record_login, record_logout
+from app.services.audit_service import (
+    record_login, record_logout, recent_failed_logins,
+)
 from app.services.jwt_service import decode_token_claims
 from app.services.token_revocation_service import revoke_token
 
@@ -92,6 +94,23 @@ async def login(
         await record_login(db, user.id if user else None, success=False,
                            email_domain=credentials.email.rsplit("@", 1)[-1])
         raise HTTPException(status_code=401, detail="Please sign in with Google for this account")
+
+    # Account lockout BEFORE the password is checked, so a locked account costs
+    # an attacker one indexed count instead of a bcrypt verification — which is
+    # also what stops the endpoint being used as a CPU sink.
+    #
+    # Deliberately not revealing that the account is locked, only that it is
+    # rate limited; "this account exists and is under attack" is not something
+    # to confirm to whoever is attacking it.
+    failures = await recent_failed_logins(
+        db, user.id, settings.FAILED_LOGIN_WINDOW_MINUTES
+    )
+    if failures >= settings.MAX_FAILED_LOGINS:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed attempts. Please wait a few minutes and try again.",
+            headers={"Retry-After": str(settings.FAILED_LOGIN_WINDOW_MINUTES * 60)},
+        )
 
     if not verify_password(credentials.password, user.password_hash):
         await record_login(db, user.id, success=False,

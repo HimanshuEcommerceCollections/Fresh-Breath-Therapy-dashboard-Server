@@ -224,6 +224,31 @@ async def record_logout(db: AsyncSession, user_id: uuid.UUID | None) -> None:
     await db.commit()
 
 
+async def recent_failed_logins(
+    db: AsyncSession, user_id: uuid.UUID, within_minutes: int
+) -> int:
+    """How many times this account has failed to log in recently.
+
+    Counted from the audit log rather than a dedicated counter table, because
+    the rows already exist and are already indexed on created_at — the
+    login_failed entries written by record_login are exactly this question's
+    data.
+
+    Two properties that a per-IP limiter cannot offer: it is EXACT across
+    instances, since every process reads the same table, and it follows the
+    ACCOUNT rather than the source, so an attempt spread over many addresses
+    still trips it.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=within_minutes)
+    return (await db.execute(
+        select(func.count())
+        .select_from(AuditLog)
+        .where(AuditLog.action == AuditAction.LOGIN_FAILED.value)
+        .where(AuditLog.entity_id == user_id)
+        .where(AuditLog.created_at >= cutoff)
+    )).scalar_one()
+
+
 # ── retention ─────────────────────────────────────────────────────────────
 
 async def purge_expired(db: AsyncSession, retention_days: int) -> int:

@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select, func, or_, update
 
 from app.database import get_db
@@ -10,6 +10,7 @@ from app.models.user import User
 from app.models.therapist import Therapist
 from app.dependencies.auth import get_current_user, get_own_therapist
 from app.services.audit_service import record_read
+from app.services.pagination import MAX_PAGE_SIZE
 from app.schemas.notification import NotificationResponse, NotificationSummaryResponse, NotificationTab
 
 router = APIRouter(prefix="/api/notifications", tags=["notifications"])
@@ -45,6 +46,7 @@ def _scope_query(query, current_user: User, own_therapist: Therapist | None):
 @router.get("", response_model=list[NotificationResponse])
 async def list_notifications(
     tab: NotificationTab = NotificationTab.ALL,
+    limit: int = Query(default=100, ge=1, le=MAX_PAGE_SIZE),
     db=Depends(get_db),
     current_user: User = Depends(get_current_user),
     own_therapist: Therapist | None = Depends(get_own_therapist),
@@ -61,7 +63,13 @@ async def list_notifications(
     elif tab == NotificationTab.ALERTS:
         query = query.where(Notification.badge.in_(ALERT_BADGES))
 
-    result = await db.execute(query.order_by(Notification.created_at.desc()))
+    # Capped. This returned EVERY notification in one response — 146 on the
+    # current data, growing every 15 minutes as the scheduler runs — and each
+    # one is a PHI read. Newest-first with a ceiling is what the bell actually
+    # needs; nobody scrolls to notification 400.
+    result = await db.execute(
+        query.order_by(Notification.created_at.desc()).limit(limit)
+    )
     items = result.scalars().all()
     # These are PHI reads, not housekeeping: notification bodies embed client
     # and lead names (scheduler_service.py, webhooks.py), and an unassigned
@@ -69,7 +77,7 @@ async def list_notifications(
     await record_read(
         db, "notification",
         entity_ids=[i.id for i in items],
-        criteria={"tab": tab.value},
+        criteria={"tab": tab.value, "limit": limit},
     )
     return items
 

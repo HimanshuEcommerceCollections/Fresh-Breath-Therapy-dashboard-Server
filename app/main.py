@@ -12,6 +12,7 @@ from app.middleware.errors import (
     http_exception_audit_handler, unhandled_exception_handler,
 )
 from app.middleware.headers import SecurityHeadersMiddleware
+from app.middleware.rate_limit import RateLimitMiddleware
 from app.middleware.request_id import RequestIdMiddleware
 from app.startup import ensure_auth_bootstrap
 # Imported for its side effect: this is what registers the before_flush hook
@@ -69,6 +70,13 @@ app.add_middleware(CsrfProtectionMiddleware, allowed_origins=allowed_origins)
 # WRAPS the CSRF check (registered after it, so it sits outside), because a
 # cross-site write attempt is itself a denied attempt worth recording and the
 # CSRF middleware needs a context to record it against.
+# Registered BEFORE CORS so CORS ends up wrapping it. A 429 has to travel back
+# out through CORSMiddleware or the browser reports an opaque network error
+# instead of the status — and "slow down" is exactly the message the frontend
+# should be able to read and show. The extra work per rejected request is a few
+# header lookups, which is not what a flood costs.
+app.add_middleware(RateLimitMiddleware)
+
 app.add_middleware(AuditContextMiddleware)
 
 app.add_middleware(

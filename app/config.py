@@ -76,6 +76,13 @@ class Settings(BaseSettings):
     # makes extra="forbid" viable.
     INITIAL_ADMIN_EMAIL: str | None = None
     INITIAL_ADMIN_PASSWORD: str | None = None
+    # ── brute-force lockout (item 1.9) ────────────────────────────────────
+    # Counted per ACCOUNT out of the audit log's login_failed entries, so it is
+    # exact across instances and follows the account rather than the source
+    # address. The per-IP limiter in middleware/rate_limit.py is the other half.
+    MAX_FAILED_LOGINS: int = 8
+    FAILED_LOGIN_WINDOW_MINUTES: int = 15
+
     # ── audit log retention ───────────────────────────────────────────────
     # HIPAA 164.316(b)(2) requires documentation to be kept six years, and
     # audit records are treated as required documentation. Configurable rather
