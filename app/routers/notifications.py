@@ -23,9 +23,22 @@ def _scope_query(query, current_user: User, own_therapist: Therapist | None):
     if current_user.role.name == "Therapist":
         if own_therapist is None:
             raise HTTPException(status_code=403, detail="No therapist record linked to this account")
-        query = query.where(
-            or_(Notification.therapist_id == own_therapist.id, Notification.therapist_id.is_(None))
-        )
+        # Their own notifications and NOTHING ELSE.
+        #
+        # This used to also admit rows with therapist_id IS NULL, which quietly
+        # defeated the caseload boundary every other query enforces. The
+        # scheduler sets therapist_id from the client's assigned therapist, so
+        # an UNASSIGNED client produced a null — and the body text carries that
+        # client's name (scheduler_service.py). Website enquiries are created
+        # with no therapist at all and name the lead. Net effect: every
+        # therapist could read the names of clients and leads outside their
+        # caseload, through the notification bell.
+        #
+        # A null therapist_id now means "unassigned, so Admin/Coordinator
+        # only" — which is correct, since triaging unassigned work is their
+        # job. Admin and Coordinator are not filtered here at all, so those
+        # notifications still reach the people who act on them.
+        query = query.where(Notification.therapist_id == own_therapist.id)
     return query
 
 

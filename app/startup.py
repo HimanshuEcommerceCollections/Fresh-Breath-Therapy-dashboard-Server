@@ -1,11 +1,14 @@
-import uuid
+import logging
 import os
+import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.role import Role
 from app.models.user import User
 from app.services.security import hash_password
+
+logger = logging.getLogger(__name__)
 
 
 async def _ensure_roles(db: AsyncSession) -> dict[str, uuid.UUID]:
@@ -30,7 +33,10 @@ async def _ensure_first_admin(db: AsyncSession, admin_role_id: uuid.UUID):
     email = os.getenv("INITIAL_ADMIN_EMAIL")
     password = os.getenv("INITIAL_ADMIN_PASSWORD")
     if not email or not password:
-        print("WARNING: no users exist and INITIAL_ADMIN_EMAIL/INITIAL_ADMIN_PASSWORD not set. No one can log in yet.")
+        logger.warning(
+            "No users exist and INITIAL_ADMIN_EMAIL/INITIAL_ADMIN_PASSWORD are not "
+            "set. No one can log in yet."
+        )
         return
 
     db.add(User(
@@ -40,7 +46,10 @@ async def _ensure_first_admin(db: AsyncSession, admin_role_id: uuid.UUID):
         password_hash=hash_password(password),
         role_id=admin_role_id,
     ))
-    print(f"Created initial admin user: {email}")
+    # The address is not logged. It is staff rather than patient data, but it
+    # is still an identifier and stdout is the least protected place it could
+    # land; whoever set the env var already knows which account this is.
+    logger.info("Created the initial admin user from INITIAL_ADMIN_EMAIL.")
 
 async def ensure_auth_bootstrap(db: AsyncSession):
     """Runs exactly once per server process, at boot — NOT per request.

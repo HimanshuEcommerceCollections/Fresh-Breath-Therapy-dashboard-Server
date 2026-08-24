@@ -17,6 +17,7 @@ from app.startup import ensure_auth_bootstrap
 # Imported for its side effect: this is what registers the before_flush hook
 # that turns every ORM write into an audit record.
 from app.services.audit_listener import register_audit_listener
+from app.services.log_redaction import install_phi_log_redaction
 from app.routers import (
     auth, locations, therapists, leads, clients, follow_up,
     organization, roles, packages, feature_flags,
@@ -104,6 +105,10 @@ app.add_exception_handler(Exception, unhandled_exception_handler)
 app.add_exception_handler(StarletteHTTPException, http_exception_audit_handler)
 
 register_audit_listener()
+
+# Seatbelt, not a substitute for not logging PHI: the known offenders are
+# gone, but nothing stops the next logger.info(f"client: {client}").
+install_phi_log_redaction()
 
 app.include_router(auth.router)
 app.include_router(locations.router)
