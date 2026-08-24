@@ -43,7 +43,10 @@ async def google_login():
     redirect = RedirectResponse(f"{GOOGLE_AUTH_URL}?{query}")
     redirect.set_cookie(
         key="oauth_state", value=state, httponly=True,
-        samesite="lax", secure=False, max_age=600,
+        # secure=True: this cookie IS the CSRF protection for the Google login
+        # flow, so it must never travel over plaintext. It was False, which let
+        # a browser send it unencrypted.
+        samesite="lax", secure=True, max_age=600,
     )
     return redirect
 

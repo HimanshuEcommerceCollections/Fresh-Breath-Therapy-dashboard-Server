@@ -1,3 +1,4 @@
+import pathlib
 import re
 from pydantic_settings import BaseSettings
 
@@ -39,13 +40,25 @@ class Settings(BaseSettings):
     SMTP_USER: str | None = None
     SMTP_PASSWORD: str | None = None
     SMTP_FROM_EMAIL: str | None = None
-    EMAIL_SERVICE: bool = False  # flip to true once SMTP is confirmed working end-to-end
+    # NO DEFAULT, deliberately. This single flag decides whether a second
+    # factor exists at all, and its old default of False was half of a full
+    # authentication bypass (see the ticket-binding work in otp_service.py).
+    # There is no safe value to guess: False silently disables 2FA, True breaks
+    # every login if SMTP is not actually working. So the operator has to say,
+    # and the app refuses to start until they do.
+    EMAIL_SERVICE: bool
     # Shared secret for the /api/internal/notification-scan route — required
     # so the AsyncIOScheduler-based scan (Render-only, see scheduler_service.py)
     # can also be triggered externally (e.g. Vercel Cron) if this ever runs
     # somewhere the in-process scheduler can't. No default: unset means the
     # route refuses every request rather than running unauthenticated.
     CRON_SECRET: str | None = None
+    # Used once, to create the very first admin when the users table is empty.
+    # Declared here rather than read with os.getenv so that every environment
+    # variable this app consumes is visible in one place — which is also what
+    # makes extra="forbid" viable.
+    INITIAL_ADMIN_EMAIL: str | None = None
+    INITIAL_ADMIN_PASSWORD: str | None = None
     # ── audit log retention ───────────────────────────────────────────────
     # HIPAA 164.316(b)(2) requires documentation to be kept six years, and
     # audit records are treated as required documentation. Configurable rather
@@ -118,7 +131,16 @@ class Settings(BaseSettings):
 
     class Config:
         env_file = ".env"
-        extra = "ignore"
+        # FORBID, not ignore. With "ignore" a misspelled variable was silently
+        # discarded: set SECRET_KEYY on the host and the app booted happily
+        # using a different key, or none. Security settings that fail quietly
+        # are worse than ones that fail loudly, so an unrecognised key in .env
+        # now stops startup instead of being swallowed.
+        #
+        # Note this only polices the .env FILE. Real environment variables are
+        # matched by field name, so the platform's own vars (PORT, RENDER_*)
+        # are never collected and cannot trip this.
+        extra = "forbid"
 
     # ── resolved connection URLs ──────────────────────────────────────────
 
@@ -182,4 +204,46 @@ class Settings(BaseSettings):
         return match.group(1) if match else "unknown"
 
 
+def _assert_no_unknown_env_file_keys(path: str = ".env") -> None:
+    """Refuse to start if .env contains a key no setting will ever read.
+
+    This exists because pydantic-settings' extra="forbid" does NOT cover dotenv
+    keys here. Its DotEnvSettingsSource only raises for a key that does not
+    start with env_prefix, and our prefix is the empty string — so every key
+    "starts with" it and the check never fires. extra="forbid" is kept above
+    because it still governs values passed to the constructor directly, but it
+    is not what catches a typo in the file.
+
+    Which matters, because the failure it prevents is silent: set SECRET_KEYY
+    on a host and the old behaviour was to discard it and boot with a different
+    key, or none, with nothing in the logs. A security setting that fails
+    quietly is worse than one that fails loudly.
+
+    Only the FILE is checked. Real environment variables are matched by field
+    name, so a platform's own vars (PORT, RENDER_*, PYTHON_VERSION) are never
+    collected and must not be treated as errors.
+    """
+    env_path = pathlib.Path(path)
+    if not env_path.is_file():
+        return
+
+    known = set(Settings.model_fields)
+    unknown = []
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key and key not in known:
+            unknown.append(key)
+
+    if unknown:
+        raise RuntimeError(
+            f"{env_path} defines {len(unknown)} key(s) that no setting reads: "
+            f"{', '.join(sorted(unknown))}. Either a typo or a leftover — fix or "
+            f"remove it. Refusing to start rather than ignoring it silently."
+        )
+
+
 settings = Settings()
+_assert_no_unknown_env_file_keys()

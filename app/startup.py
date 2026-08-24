@@ -1,9 +1,9 @@
 import logging
-import os
 import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.models.role import Role
 from app.models.user import User
 from app.services.security import hash_password
@@ -30,8 +30,8 @@ async def _ensure_first_admin(db: AsyncSession, admin_role_id: uuid.UUID):
     if result.first() is not None:
         return  # at least one user already exists — never touch this again
 
-    email = os.getenv("INITIAL_ADMIN_EMAIL")
-    password = os.getenv("INITIAL_ADMIN_PASSWORD")
+    email = settings.INITIAL_ADMIN_EMAIL
+    password = settings.INITIAL_ADMIN_PASSWORD
     if not email or not password:
         logger.warning(
             "No users exist and INITIAL_ADMIN_EMAIL/INITIAL_ADMIN_PASSWORD are not "
