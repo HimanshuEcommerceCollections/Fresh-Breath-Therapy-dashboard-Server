@@ -295,6 +295,33 @@ async def verify_signup_otp(
     return VerifyOtpResponse(detail="Email verified. Awaiting admin approval.")
 
 
+@router.post("/users/{user_id}/revoke-sessions", status_code=status.HTTP_204_NO_CONTENT)
+async def revoke_user_sessions(
+    user_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin()),
+):
+    """Sign an account out of every device, immediately.
+
+    The break-glass control for a lost laptop or a departure. /logout only ever
+    revoked the one token that called it, so there was previously no answer to
+    "end this person's sessions now" other than waiting out the expiry.
+
+    One timestamp does it: get_current_user refuses any token issued earlier.
+    That covers every device at once and cannot miss one, because there is no
+    list to enumerate and therefore no list to get wrong.
+
+    Audited automatically — this is an UPDATE to a registered model, so the
+    write listener records who did it and to whom.
+    """
+    target = await db.get(User, user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    target.sessions_revoked_at = datetime.now(timezone.utc)
+    await db.commit()
+
+
 @router.get("/role-requests", response_model=list[RoleRequestResponse])
 async def list_role_requests(
     status_filter: RoleRequestStatus | None = None,

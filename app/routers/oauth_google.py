@@ -99,6 +99,22 @@ async def google_callback(
         if not email or not email_verified:
             return _login_error_redirect("email_not_verified")
 
+        # Hosted-domain check. Without it any Google account can complete this
+        # flow and create a pending signup request, so rejecting strangers is
+        # manual work that arrives by surprise.
+        #
+        # `hd` is the authoritative claim but is only present for Workspace
+        # accounts — a personal gmail.com login has none — so the address's own
+        # domain is the fallback. Skipped entirely when unconfigured, which
+        # keeps the current behaviour rather than locking anyone out on deploy.
+        allowed_domains = settings.allowed_google_domains
+        if allowed_domains:
+            hosted_domain = (profile.get("hd") or "").strip().lower()
+            email_domain = email.rsplit("@", 1)[-1].lower()
+            if hosted_domain not in allowed_domains and email_domain not in allowed_domains:
+                logger.warning("Google sign-in refused: domain not allowed")
+                return _login_error_redirect("domain_not_allowed")
+
         result = await db.execute(
             select(User).options(selectinload(User.role)).where(User.email == email)
         )

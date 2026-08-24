@@ -6,7 +6,19 @@ class Settings(BaseSettings):
     DATABASE_URL: str
     SECRET_KEY: str
     ALGORITHM: str = "HS256"
+    # This doubles as the IDLE window. The token is re-issued while the user is
+    # active (see dependencies/auth.py), so it only actually expires after this
+    # long with no requests at all — which is what "automatic logoff after 30
+    # minutes idle" means to the person using it.
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    # Hard ceiling regardless of activity, so a session cannot slide forever on
+    # a machine somebody left open. A shift is under 12 hours; anyone still
+    # working past it signs in again.
+    SESSION_ABSOLUTE_HOURS: int = 12
+    # Do not mint a new token on every single request — that would be a
+    # Set-Cookie on every response for no benefit. Re-issue only once the
+    # current one is this old, so a busy user gets a handful per hour.
+    TOKEN_REISSUE_AFTER_MINUTES: int = 5
     # Which deployment this process is. Defaults to the LOCKED-DOWN value on
     # purpose, which is the opposite of how these flags usually read.
     #
@@ -24,6 +36,11 @@ class Settings(BaseSettings):
     CLOUDINARY_API_SECRET: str | None = None
     GOOGLE_CLIENT_ID: str | None = None
     GOOGLE_CLIENT_SECRET: str | None = None
+    # Comma-separated Google Workspace domains permitted to sign in, e.g.
+    # "freshbreaththerapy.com". Empty means ANY Google account on earth can
+    # complete the OAuth flow and land in the pending-approval queue for someone
+    # to reject by hand. Set this.
+    ALLOWED_GOOGLE_DOMAINS: str | None = None
     GOOGLE_REDIRECT_URI: str = "https://fresh-breath-therapy-dashboard-serv.vercel.app/api/auth/google/callback"
     FRONTEND_URL: str = "https://fresh-breath-therapy-dashboard-ui.vercel.app"
     # Exact origins, never a wildcard: allow_credentials=True is set in
@@ -148,6 +165,11 @@ class Settings(BaseSettings):
     def _with_port(url: str, port: int) -> str:
         """Swap the port in a postgres URL, leaving credentials untouched."""
         return re.sub(r"(?<=:)\d+(?=/[^/]*$)", str(port), url, count=1)
+
+    @property
+    def allowed_google_domains(self) -> set[str]:
+        raw = self.ALLOWED_GOOGLE_DOMAINS or ""
+        return {d.strip().lower() for d in raw.split(",") if d.strip()}
 
     @property
     def is_development(self) -> bool:
