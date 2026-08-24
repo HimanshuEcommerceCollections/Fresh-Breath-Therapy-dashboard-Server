@@ -213,7 +213,7 @@ class ImportRow(Base):
     # NEVER edited — this is the audit trail of what the spreadsheet said.
     raw_payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
     # Corrections the admin typed on the review screen, keyed by FIELD name:
-    # {"email": "kristen.reyes@fbtclinic.com"}. Layered over raw_payload at
+    # {"email": "user@example.com"}. Layered over raw_payload at
     # validation time so a one-character typo doesn't need a round trip
     # through the spreadsheet, while leaving the original readable.
     overrides: Mapped[dict | None] = mapped_column(JSONB, nullable=True)

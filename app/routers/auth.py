@@ -21,7 +21,8 @@ from app.services.otp_service import (
     OTP_TTL_MINUTES, request_otp, resolve_ticket, verify_otp,
 )
 from app.schemas.otp import (
-    OtpRequestResponse, ResendOtpRequest, VerifyOtpRequest, VerifyOtpResponse,
+    OtpRequestResponse, PendingLoginResponse, ResendOtpRequest, VerifyOtpRequest,
+    VerifyOtpResponse,
 )
 from app.config import settings
 from app.services.auth_cookie import (
@@ -57,6 +58,20 @@ def _assert_may_hold_session(user: User) -> None:
         raise HTTPException(status_code=403, detail="Account pending admin approval")
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account is inactive")
+
+
+def _mask_email(email: str) -> str:
+    """"kristen@fbtclinic.com" -> "k*****@fbtclinic.com".
+
+    Enough for someone to recognise which inbox to check, not enough to be a
+    disclosure if it is screenshotted, cached or logged. The domain is kept
+    because that is what tells a user they used the wrong account.
+    """
+    local, _, domain = email.partition("@")
+    if not domain:
+        return "*" * len(email)
+    head = local[:1] if local else ""
+    return f"{head}{'*' * max(len(local) - 1, 1)}@{domain}"
 
 
 def _assert_ticket_matches_email(user: User, claimed_email: str) -> None:
@@ -163,7 +178,8 @@ async def verify_login_otp(
     otp = await verify_otp(db, ticket, purpose="login", code=payload.code)
     user = otp.user  # loaded with .role by resolve_ticket
 
-    _assert_ticket_matches_email(user, payload.email)
+    if payload.email is not None:
+        _assert_ticket_matches_email(user, payload.email)
     _assert_may_hold_session(user)
 
     # Spend the ticket before handing out the session: one login attempt, one
@@ -223,6 +239,51 @@ async def resend_otp(
     expires_at, ticket = await request_otp(db, user.id, user.email, purpose=payload.purpose)
     _issue_login_ticket(response, ticket)
     return OtpRequestResponse(expires_at=expires_at)
+
+
+@router.get("/pending-login", response_model=PendingLoginResponse)
+async def get_pending_login(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """What the OTP screen needs, without putting it in a URL.
+
+    The address used to be passed as /verify-otp?email=..., which lands in
+    platform access logs, browser history and any referrer — audit item 4.4.
+    The login ticket already identifies the attempt, so the page can ask for
+    what it needs instead of carrying it.
+
+    Returns a MASKED address. The screen only has to say which inbox to check;
+    it never needs the whole thing, and a masked value is harmless in a
+    screenshot or a cache.
+
+    Authenticated by the ticket alone, which is the point — there is no session
+    yet at this stage.
+    """
+    ticket = request.cookies.get(LOGIN_TICKET_COOKIE)
+
+    # One endpoint serves both flows, so the client does not have to know which
+    # kind of ticket it is holding. resolve_ticket RAISES rather than returning
+    # None, hence the try/except rather than a truthiness check.
+    otp = None
+    for purpose in ("login", "signup"):
+        try:
+            otp = await resolve_ticket(db, ticket, purpose)
+            break
+        except HTTPException:
+            continue
+
+    if otp is None:
+        raise HTTPException(
+            status_code=401,
+            detail="This login session is no longer valid. Please sign in again.",
+        )
+
+    return PendingLoginResponse(
+        email_masked=_mask_email(otp.user.email),
+        expires_at=otp.expires_at,
+        purpose=otp.purpose,
+    )
 
 
 @router.get("/me", response_model=UserResponse)
@@ -306,7 +367,8 @@ async def verify_signup_otp(
     # success for an email it never checked.
     ticket = request.cookies.get(LOGIN_TICKET_COOKIE)
     otp = await verify_otp(db, ticket, purpose="signup", code=payload.code)
-    _assert_ticket_matches_email(otp.user, payload.email)
+    if payload.email is not None:
+        _assert_ticket_matches_email(otp.user, payload.email)
 
     # No session is minted here — the account is still pending admin approval —
     # but the spent ticket still gets cleared out of the browser.

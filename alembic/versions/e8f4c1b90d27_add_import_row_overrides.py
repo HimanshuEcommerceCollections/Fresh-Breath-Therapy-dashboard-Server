@@ -21,7 +21,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     # Corrections the admin types on the review screen, keyed by FIELD name:
-    # {"email": "kristen.reyes@fbtclinic.com"}. Applied over the sheet's cell
+    # {"email": "user@example.com"}. Applied over the sheet's cell
     # at validation time.
     #
     # A separate column rather than an edit to raw_payload, deliberately:

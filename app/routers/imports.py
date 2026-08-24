@@ -32,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.services.audit_service import record_read
+from app.services.upload_validation import sanitize_filename
 from app.dependencies.auth import require_admin
 from app.models.import_batch import (
     ImportBatch, ImportRow, ImportRowStatus, ImportStatus,
@@ -355,7 +356,10 @@ async def create_import(
             status_code=413,
             detail=f"File is larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
         )
-    filename = file.filename or "upload.csv"
+    # Sanitised before it is stored and rendered in the import history table.
+    # Never used as a path, so this is not traversal — but control characters
+    # and unbounded length have no business in a database column either.
+    filename = sanitize_filename(file.filename)
 
     try:
         sheet = parse_sheet(content, filename)

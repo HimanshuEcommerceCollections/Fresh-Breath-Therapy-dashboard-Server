@@ -13,6 +13,8 @@ nothing ever removed anything from:
   * otp_codes          — one row per login attempt, kept after use.
   * revoked_tokens     — one row per logout, kept after the token it names has
                          itself expired and become unusable.
+  * notifications      — bodies naming the client or lead they concern, kept
+                         indefinitely after being read.
 
 All four carried a TODO(retention) comment and none had a mechanism to hang a
 policy on, which is exactly how a retention requirement goes quietly unmet.
@@ -40,6 +42,7 @@ from app.config import settings
 from app.models.audit_log import AuditAction
 from app.models.idempotency_key import IdempotencyKey
 from app.models.import_batch import ImportBatch, ImportRow
+from app.models.notification import Notification
 from app.models.otp_code import OtpCode
 from app.models.revoked_token import RevokedToken
 from app.services.audit_context import AuditContext
@@ -156,6 +159,33 @@ async def purge_expired_revoked_tokens(db: AsyncSession) -> int:
     return removed
 
 
+async def purge_old_notifications(db: AsyncSession, retention_days: int) -> int:
+    """Delete READ notifications past the retention window.
+
+    Their bodies name the client or lead they concern — see scheduler_service
+    and webhooks — which is what makes them useful and is now only visible to
+    someone entitled to read that name, since the therapist_id IS NULL loophole
+    was closed. A read reminder from four months ago is PHI kept for nothing.
+
+    Unread rows are left alone at any age: an unread notification is
+    outstanding work, and deleting it silently drops the reminder rather than
+    the data.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    result = await db.execute(
+        delete(Notification)
+        .where(Notification.is_read.is_(True))
+        .where(Notification.created_at < cutoff)
+    )
+    removed = result.rowcount or 0
+    if removed:
+        _audit(db, "notification", removed, {
+            "cutoff": cutoff.isoformat(), "retention_days": retention_days,
+            "scope": "read_only",
+        })
+    return removed
+
+
 async def run_retention_sweep(db: AsyncSession) -> dict[str, int]:
     """Every retention rule, in one transaction.
 
@@ -172,6 +202,9 @@ async def run_retention_sweep(db: AsyncSession) -> dict[str, int]:
         ),
         "otp_codes_removed": await purge_spent_otp_codes(db),
         "revoked_tokens_removed": await purge_expired_revoked_tokens(db),
+        "notifications_removed": await purge_old_notifications(
+            db, settings.NOTIFICATION_RETENTION_DAYS
+        ),
     }
     await db.commit()
     if any(counts.values()):

@@ -31,6 +31,7 @@ from difflib import SequenceMatcher
 from typing import Protocol
 
 from app.services.importer import normalizers
+from app.services.log_redaction import redact
 from app.services.importer.parser import ParsedSheet
 from app.services.importer.registry import (
     FieldKind, FieldSpec, get_entity, mappable_field_names,
@@ -153,14 +154,43 @@ def build_column_profiles(sheet: ParsedSheet) -> list[dict]:
         distinct = sheet.distinct(header, limit=LOW_CARDINALITY + 1)
         samples = sheet.samples(header, limit=8)
         low_cardinality = 0 < len(distinct) <= LOW_CARDINALITY
+        # Low-cardinality columns exist so the model can see an enum's
+        # vocabulary ("Ongoing Therapy" -> ongoing_therapy), which needs the
+        # real strings. But "few distinct values" is a proxy for "this is an
+        # enum", and on a SMALL SHEET a name, email or phone column satisfies
+        # it too — a 12-row import has at most 12 distinct emails. Those were
+        # going out verbatim.
+        #
+        # So the vocabulary is still sent, with anything PHI-SHAPED scrubbed
+        # out of it first. An enum value is unaffected; an address or a phone
+        # number is not a vocabulary and loses nothing by being redacted.
+        values = (
+            [_scrub_phi(v) for v in distinct]
+            if low_cardinality else [_mask(s) for s in samples]
+        )
         profiles.append({
             "header": header,
             "distinct_count": len(sheet.value_counts(header)),
             "low_cardinality": low_cardinality,
-            "values": distinct if low_cardinality else [_mask(s) for s in samples],
+            "values": values,
             "masked": not low_cardinality,
         })
     return profiles
+
+
+# Longest value worth showing a model. Past this it is free text, not a
+# vocabulary, and a long cell is exactly where a note or an address lives.
+MAX_PROFILE_VALUE_LENGTH = 60
+
+
+def _scrub_phi(value) -> str:
+    """A low-cardinality value with anything identifying removed.
+
+    Reuses the log filter's patterns so there is ONE definition of
+    "PHI-shaped" in the codebase rather than two that drift.
+    """
+    text = str(value)[:MAX_PROFILE_VALUE_LENGTH]
+    return redact(text)
 
 
 def _parse_rate(spec: FieldSpec, samples: list, date_order: str) -> float | None:

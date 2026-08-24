@@ -106,6 +106,11 @@ class Settings(BaseSettings):
     # answered within seconds. Stripe keeps theirs 24 hours; anything longer is
     # a copy of a client record for no reason.
     IDEMPOTENCY_KEY_RETENTION_HOURS: int = 24
+    # Notification bodies name the client or lead they concern — that is what
+    # makes them useful, and with therapist scoping fixed they only reach people
+    # entitled to read the name. But a read reminder from four months ago is
+    # PHI kept for nothing, so they age out.
+    NOTIFICATION_RETENTION_DAYS: int = 90
 
     # ── pooling ───────────────────────────────────────────────────────────
     # Supabase exposes the same database three ways, and which one you use

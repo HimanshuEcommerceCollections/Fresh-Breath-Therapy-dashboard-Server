@@ -1,7 +1,6 @@
 import logging
 import secrets
 import uuid
-from urllib.parse import urlencode
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
@@ -149,13 +148,12 @@ async def google_callback(
             # redirect, so params carry what the login form would otherwise pass
             # via JSON) to finish the same verify-login-otp step password users go
             # through.
-            expires_at, ticket = await request_otp(db, user.id, user.email, purpose="login")
-            query = urlencode({
-                "email": user.email,
-                "flow": "login",
-                "expiresAt": expires_at.isoformat(),
-            })
-            redirect = RedirectResponse(f"{settings.FRONTEND_URL}/verify-otp?{query}")
+            _, ticket = await request_otp(db, user.id, user.email, purpose="login")
+            # No email and no expiry in the URL. This is a full-page redirect,
+            # so anything here is recorded in platform access logs and browser
+            # history (audit item 4.4); the OTP page asks
+            # GET /api/auth/pending-login for a masked address instead.
+            redirect = RedirectResponse(f"{settings.FRONTEND_URL}/verify-otp?flow=login")
             # Google asserting this identity is what earns the ticket here, in
             # place of the password check /login does. It rides as a cookie
             # rather than a query param for the obvious reason: this is a
