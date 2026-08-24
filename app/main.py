@@ -1,5 +1,6 @@
 from dotenv import load_dotenv
 load_dotenv()
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -45,10 +46,27 @@ from app.services.scheduler_service import start_scheduler
 #
 # Passing None does not hide the route behind a 403 — it is never registered,
 # so there is nothing there to probe.
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """Startup work, as a lifespan handler.
+
+    Replaces three @app.on_event("startup") hooks. on_event still functions but
+    is deprecated and warns on every boot — and a deprecation left in place is
+    how a dependency bump eventually becomes an outage. Same three steps, same
+    order, one handler.
+    """
+    log_connection_mode()
+    async with AsyncSessionLocal() as db:
+        await ensure_auth_bootstrap(db)
+    start_scheduler()
+    yield
+
+
 _docs_enabled = settings.is_development
 
 app = FastAPI(
     title="FBT Dashboard API",
+    lifespan=lifespan,
     docs_url="/docs" if _docs_enabled else None,
     redoc_url="/redoc" if _docs_enabled else None,
     openapi_url="/openapi.json" if _docs_enabled else None,
@@ -143,19 +161,6 @@ app.include_router(exports.router)
 app.include_router(webhooks.router)
 app.include_router(imports.router)
 app.include_router(audit_logs.router)
-
-@app.on_event("startup")
-async def _start_scheduler():
-    start_scheduler()
-
-@app.on_event("startup")
-async def _log_db_mode():
-    log_connection_mode()
-
-@app.on_event("startup")
-async def on_startup():
-    async with AsyncSessionLocal() as db:
-        await ensure_auth_bootstrap(db)
 
 @app.get("/health")
 async def health_check():
