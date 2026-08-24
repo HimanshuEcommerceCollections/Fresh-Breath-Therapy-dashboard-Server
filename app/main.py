@@ -21,7 +21,8 @@ from app.routers import (
     auth, locations, therapists, leads, clients, follow_up,
     organization, roles, packages, feature_flags,
     payments, enrollments, reports, oauth_google, uploads, sessions, dashboard,
-    pto, notifications, client_messages, internal, exports, webhooks, imports
+    pto, notifications, client_messages, internal, exports, webhooks, imports,
+    audit_logs,
 )
 from app.services.scheduler_service import start_scheduler
 
@@ -128,6 +129,7 @@ app.include_router(internal.router)
 app.include_router(exports.router)
 app.include_router(webhooks.router)
 app.include_router(imports.router)
+app.include_router(audit_logs.router)
 
 @app.on_event("startup")
 async def _start_scheduler():
