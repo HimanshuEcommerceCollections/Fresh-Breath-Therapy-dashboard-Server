@@ -25,7 +25,7 @@ from app.routers import (
     organization, roles, packages, feature_flags,
     payments, enrollments, reports, oauth_google, uploads, sessions, dashboard,
     pto, notifications, client_messages, internal, exports, webhooks, imports,
-    audit_logs,
+    audit_logs, security_settings,
 )
 from app.services.scheduler_service import start_scheduler
 
@@ -161,6 +161,7 @@ app.include_router(exports.router)
 app.include_router(webhooks.router)
 app.include_router(imports.router)
 app.include_router(audit_logs.router)
+app.include_router(security_settings.router)
 
 @app.get("/health")
 async def health_check():
