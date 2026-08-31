@@ -17,6 +17,7 @@ from app.schemas.therapist import TherapistCreate, TherapistUpdate, TherapistRes
 from app.models.user import User
 from app.dependencies.auth import get_current_user, get_own_therapist, require_admin
 from app.services.audit_service import record_denied_on, record_read
+from app.services.cloudinary_service import delete_avatar, upload_avatar
 
 router = APIRouter(prefix="/api/therapists", tags=["therapists"])
 
@@ -221,6 +222,18 @@ async def delete_therapist(
     await db.execute(
         delete(PtoTransaction).where(PtoTransaction.therapist_id == therapist_id)
     )
+
+    # Their photograph goes with the record. Nothing used to remove it, so a
+    # deleted therapist's image stayed publicly readable in object storage
+    # indefinitely (audit item 9.1). Captured BEFORE the delete, because the
+    # attributes are gone afterwards.
+    #
+    # Storage first, then the row: delete_avatar never raises, so the worst case
+    # is a logged orphan rather than a therapist who cannot be deleted because
+    # their picture would not go away.
+    storage_key, avatar_url = therapist.avatar_storage_key, therapist.avatar_url
+    await delete_avatar(storage_key, avatar_url=avatar_url)
+
     await db.delete(therapist)
     await db.commit()
 
@@ -235,9 +248,20 @@ async def upload_therapist_avatar(
     if therapist is None:
         raise HTTPException(status_code=404, detail="Therapist not found")
 
-    url = await upload_avatar(file, folder="fbt/therapists")
+    # Remember what is being replaced before overwriting the columns.
+    previous_key, previous_url = therapist.avatar_storage_key, therapist.avatar_url
+
+    url, storage_key = await upload_avatar(file, folder="fbt/therapists")
     therapist.avatar_url = url
+    therapist.avatar_storage_key = storage_key
     await db.commit()
+
+    # AFTER the new one is safely stored and committed, not before: if this
+    # order were reversed and the upload failed, the therapist would be left
+    # with no photograph at all. Every re-upload previously orphaned the
+    # previous image, so this leaked one file per edit.
+    if previous_key or previous_url:
+        await delete_avatar(previous_key, avatar_url=previous_url)
 
     result = await db.execute(
         select(Therapist).options(selectinload(Therapist.location)).where(Therapist.id == therapist_id)

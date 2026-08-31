@@ -37,9 +37,15 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_ID: str | None = None
     GOOGLE_CLIENT_SECRET: str | None = None
     # Comma-separated Google Workspace domains permitted to sign in, e.g.
-    # "freshbreaththerapy.com". Empty means ANY Google account on earth can
-    # complete the OAuth flow and land in the pending-approval queue for someone
-    # to reject by hand. Set this.
+    # "freshbreaththerapy.com".
+    #
+    # FAILS CLOSED when unset: Google sign-in is REFUSED entirely rather than
+    # allowing any Google account on earth to complete the flow and land in the
+    # pending-approval queue. That matches the two settings above — CRON_SECRET
+    # and LEAD_WEBHOOK_SECRET both refuse every request when unconfigured — and
+    # it is the same reasoning: an unset security setting must not read as
+    # "allow all". Password sign-in is unaffected, so an unset value locks
+    # nobody out of the application, only out of the Google button.
     ALLOWED_GOOGLE_DOMAINS: str | None = None
     GOOGLE_REDIRECT_URI: str = "https://fresh-breath-therapy-dashboard-serv.vercel.app/api/auth/google/callback"
     FRONTEND_URL: str = "https://fresh-breath-therapy-dashboard-ui.vercel.app"

@@ -25,8 +25,26 @@ GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
 
 
+def _login_error_redirect(reason: str) -> RedirectResponse:
+    """Any failure past this point sends the browser back to the login page
+    instead of surfacing a raw JSON error — this is a full-page redirect
+    flow, not an XHR call the SPA can catch and render itself."""
+    redirect = RedirectResponse(f"{settings.FRONTEND_URL}/login?status=google_error&reason={reason}")
+    redirect.delete_cookie("oauth_state")
+    return redirect
+
+
 @router.get("/login")
 async def google_login():
+    # Checked here too, not only in the callback. Sending someone to Google and
+    # refusing them on the way back wastes their time and looks like a bug;
+    # refusing before the redirect tells them immediately.
+    if not settings.allowed_google_domains:
+        logger.error(
+            "Google sign-in refused: ALLOWED_GOOGLE_DOMAINS is not configured."
+        )
+        return _login_error_redirect("google_not_configured")
+
     state = secrets.token_urlsafe(24)
     params = {
         "client_id": settings.GOOGLE_CLIENT_ID,
@@ -47,15 +65,6 @@ async def google_login():
         # a browser send it unencrypted.
         samesite="lax", secure=True, max_age=600,
     )
-    return redirect
-
-
-def _login_error_redirect(reason: str) -> RedirectResponse:
-    """Any failure past this point sends the browser back to the login page
-    instead of surfacing a raw JSON error — this is a full-page redirect
-    flow, not an XHR call the SPA can catch and render itself."""
-    redirect = RedirectResponse(f"{settings.FRONTEND_URL}/login?status=google_error&reason={reason}")
-    redirect.delete_cookie("oauth_state")
     return redirect
 
 
@@ -99,20 +108,34 @@ async def google_callback(
             return _login_error_redirect("email_not_verified")
 
         # Hosted-domain check. Without it any Google account can complete this
-        # flow and create a pending signup request, so rejecting strangers is
-        # manual work that arrives by surprise.
+        # flow and create a pending signup request, so rejecting strangers
+        # becomes manual work arriving by surprise.
         #
-        # `hd` is the authoritative claim but is only present for Workspace
-        # accounts — a personal gmail.com login has none — so the address's own
-        # domain is the fallback. Skipped entirely when unconfigured, which
-        # keeps the current behaviour rather than locking anyone out on deploy.
+        # `hd` is the authoritative claim but only Workspace accounts carry it —
+        # a personal gmail.com login has none — so the address's own domain is
+        # the fallback.
         allowed_domains = settings.allowed_google_domains
-        if allowed_domains:
-            hosted_domain = (profile.get("hd") or "").strip().lower()
-            email_domain = email.rsplit("@", 1)[-1].lower()
-            if hosted_domain not in allowed_domains and email_domain not in allowed_domains:
-                logger.warning("Google sign-in refused: domain not allowed")
-                return _login_error_redirect("domain_not_allowed")
+        if not allowed_domains:
+            # FAIL CLOSED. An unconfigured allowlist previously meant "any
+            # Google account on earth", which turned rejecting strangers into
+            # manual work arriving by surprise. Refusing is the same choice
+            # CRON_SECRET and LEAD_WEBHOOK_SECRET already make when unset.
+            #
+            # Password sign-in still works, so this locks nobody out of the
+            # application — only out of the Google button, until somebody says
+            # which domains belong to the clinic.
+            logger.error(
+                "Google sign-in refused: ALLOWED_GOOGLE_DOMAINS is not configured."
+            )
+            return _login_error_redirect("google_not_configured")
+
+        hosted_domain = (profile.get("hd") or "").strip().lower()
+        email_domain = email.rsplit("@", 1)[-1].lower()
+        if hosted_domain not in allowed_domains and email_domain not in allowed_domains:
+            # The domain itself is not logged — it is an identifier, and the
+            # refusal is already recorded against the request id.
+            logger.warning("Google sign-in refused: domain not on the allowlist")
+            return _login_error_redirect("domain_not_allowed")
 
         result = await db.execute(
             select(User).options(selectinload(User.role)).where(User.email == email)
