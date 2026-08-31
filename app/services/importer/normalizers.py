@@ -1,19 +1,17 @@
-"""Turning spreadsheet cells into database values.
+"""Cell-level parsing and normalisation.
 
-Every function here is deterministic and total: given the same cell it always
-produces the same result, and anything it cannot parse raises `CellError`
-with a message written for the person who has to fix the spreadsheet — "row
-340: phone number has only 4 digits", not "ValidationError".
+ERROR MESSAGES MUST NOT CONTAIN THE CELL'S CONTENTS. Every CellError here is
+persisted to import_rows.errors and returned to the review screen by
+GET /api/imports/{batch_id}/rows, so a message that quoted the failing value
+put a client's email address or phone number into a stored, API-readable string
+— which is exactly what audit item 6.5 forbids. The value is already on the
+admin's own screen in the row it came from; the message only has to say WHY it
+failed. The caller adds the row number and column name, so
+"row 340, column email: not a valid email address" is what the admin actually
+sees, and it points at the cell without copying it.
 
-Deliberately strict about two things:
-
-  * Dates are never guessed. 03/04/2024 is the 3rd of April or the 4th of
-    March depending on who typed it, and no amount of sampling makes that
-    knowable — so the batch carries an explicit `date_order` the admin sets,
-    with a detected default.
-  * Blank never becomes a placeholder. A missing email is reported as missing
-    so it can be fixed at source. Inventing `unknown+row340@fbt.local` would
-    put a fake address in a patient record, which is worse than the gap.
+Lengths and digit counts are fine to report — they describe the value without
+being it.
 """
 from __future__ import annotations
 
@@ -92,7 +90,7 @@ def parse_date(raw, date_order: str = "MDY") -> date:
             # Excel's epoch is 1899-12-30 (its non-existent 1900 leap day is
             # already accounted for by that two-day offset).
             return (datetime(1899, 12, 30) + timedelta(days=float(raw))).date()
-        raise CellError(f"{raw!r} is not a recognisable date")
+        raise CellError("not a recognisable date")
 
     s = _text(raw)
     if not s:
@@ -128,14 +126,14 @@ def parse_date(raw, date_order: str = "MDY") -> date:
             mo, d = d, mo
         return _build_date(y, mo, d, s)
 
-    raise CellError(f"{s!r} is not a recognisable date")
+    raise CellError("not a recognisable date")
 
 
 def _build_date(y: int, mo: int, d: int, original: str) -> date:
     try:
         return date(y, mo, d)
     except ValueError:
-        raise CellError(f"{original!r} is not a real calendar date")
+        raise CellError("not a real calendar date")
 
 
 def detect_date_order(samples: list) -> tuple[str, bool]:
@@ -182,7 +180,7 @@ def parse_time(raw) -> time:
 
     m = re.match(r"^(\d{1,2})(?::(\d{2}))?(?::(\d{2}))?\s*(AM|PM)?$", s)
     if not m:
-        raise CellError(f"{s!r} is not a recognisable time")
+        raise CellError("not a recognisable time")
     h = int(m.group(1))
     minute = int(m.group(2) or 0)
     sec = int(m.group(3) or 0)
@@ -190,13 +188,13 @@ def parse_time(raw) -> time:
 
     if meridiem:
         if not 1 <= h <= 12:
-            raise CellError(f"{s!r} is not a valid 12-hour time")
+            raise CellError("not a valid 12-hour time")
         if meridiem == "PM" and h != 12:
             h += 12
         elif meridiem == "AM" and h == 12:
             h = 0
     if not (0 <= h <= 23 and 0 <= minute <= 59 and 0 <= sec <= 59):
-        raise CellError(f"{s!r} is not a valid time")
+        raise CellError("not a valid time")
     return time(h, minute, sec)
 
 
@@ -204,7 +202,7 @@ def parse_time(raw) -> time:
 
 def parse_money(raw) -> Decimal:
     if isinstance(raw, bool):
-        raise CellError(f"{raw!r} is not an amount")
+        raise CellError("not a valid amount")
     if isinstance(raw, (int, float, Decimal)):
         return Decimal(str(raw)).quantize(Decimal("0.01"))
 
@@ -215,28 +213,28 @@ def parse_money(raw) -> Decimal:
     # Strip currency symbols, thousands separators and stray spaces.
     cleaned = re.sub(r"[^\d.\-]", "", s.strip("()"))
     if not cleaned or cleaned in {"-", "."}:
-        raise CellError(f"{s!r} is not an amount")
+        raise CellError("not a valid amount")
     try:
         value = Decimal(cleaned).quantize(Decimal("0.01"))
     except InvalidOperation:
-        raise CellError(f"{s!r} is not an amount")
+        raise CellError("not a valid amount")
     return -value if negative else value
 
 
 def parse_int(raw) -> int:
     if isinstance(raw, bool):
-        raise CellError(f"{raw!r} is not a number")
+        raise CellError("not a number")
     if isinstance(raw, int):
         return raw
     if isinstance(raw, float):
         if not raw.is_integer():
-            raise CellError(f"{raw!r} is not a whole number")
+            raise CellError("not a whole number")
         return int(raw)
     s = _text(raw)
     try:
         return int(Decimal(s))
     except (InvalidOperation, ValueError):
-        raise CellError(f"{s!r} is not a whole number")
+        raise CellError("not a whole number")
 
 
 # ── booleans ──────────────────────────────────────────────────────────────
@@ -257,7 +255,7 @@ def parse_bool(raw) -> bool:
         return True
     if s in _FALSE:
         return False
-    raise CellError(f"{s!r} is not a yes/no value")
+    raise CellError("not a yes/no value")
 
 
 # ── contact details ───────────────────────────────────────────────────────
@@ -272,7 +270,7 @@ def parse_email(raw, max_length: int | None = None) -> str:
         # ten-year-old record is not a reason to reject the row.
         result = validate_email(s, check_deliverability=False)
     except EmailNotValidError as exc:
-        raise CellError(f"{s!r} is not a valid email address ({exc})")
+        raise CellError("not a valid email address")
     normalized = result.normalized.lower()
     if max_length and len(normalized) > max_length:
         raise CellError(
@@ -294,7 +292,7 @@ def parse_phone(raw) -> str:
     digits = re.sub(r"\D", "", s)
     if len(digits) < 7:
         raise CellError(
-            f"{s!r} has only {len(digits)} digits — too short for a phone number"
+            f"only {len(digits)} digits — too short for a phone number"
         )
     if len(s) > 20:
         raise CellError(f"phone number is {len(s)} characters; the limit is 20")
@@ -399,8 +397,8 @@ def parse_enum(
         return guess
     allowed = ", ".join(m.value for m in enum_cls)
     raise CellError(
-        f"{s!r} isn't one of the allowed values — choose what it means on the "
-        f"mapping screen, or correct it in the sheet. Allowed: {allowed}"
+        "not one of the allowed values — choose what it means on the mapping "
+        f"screen, or correct it in the sheet. Allowed: {allowed}"
     )
 
 

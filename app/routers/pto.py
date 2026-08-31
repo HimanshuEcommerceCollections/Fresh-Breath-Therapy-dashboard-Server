@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
 from app.database import get_db
+from app.services.audit_service import record_read
 from app.models.therapist import Therapist
 from app.models.location import Location
 from app.models.session import Session as SessionModel
@@ -116,6 +117,7 @@ async def get_pto_dashboard(
     leaderboard_raw.sort(key=lambda x: x["balance"], reverse=True)
     leaderboard = [LeaderboardItem(rank=i + 1, **item) for i, item in enumerate(leaderboard_raw)]
 
+    await record_read(db, "pto", criteria={"view": "dashboard"})
     return PtoDashboardResponse(
         stats=PtoStats(
             total_therapists=total_therapists,
@@ -158,7 +160,13 @@ async def list_therapist_pto_transactions(
         .order_by(PtoTransaction.created_at.desc())
         .limit(min(limit, 500))
     )
-    return result.scalars().all()
+    rows = result.scalars().all()
+    await record_read(
+        db, "pto_transaction",
+        entity_ids=[r.id for r in rows],
+        criteria={"therapist_id": str(therapist_id), "limit": limit},
+    )
+    return rows
 
 
 @router.post("/usage", response_model=PtoTransactionResponse, status_code=201)

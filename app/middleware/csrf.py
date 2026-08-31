@@ -51,6 +51,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
+from app.services.audit_service import record_denied
 from app.services.auth_cookie import ACCESS_TOKEN_COOKIE, LOGIN_TICKET_COOKIE
 
 # GET/HEAD/OPTIONS are excluded. OPTIONS in particular must fall through so
@@ -86,6 +87,15 @@ class CsrfProtectionMiddleware(BaseHTTPMiddleware):
                 or self._reject_foreign_origin(request)
             )
             if rejection is not None:
+                # A cross-site write attempt against a live session is exactly
+                # the kind of denied attempt audit item 3.5 wants recorded, and
+                # it cannot reach the HTTPException handler because middleware
+                # returns a response rather than raising.
+                #
+                # NOTE this is one insert per rejection, so a determined flood
+                # writes rows. Rate limiting on these routes (audit item 1.9)
+                # is the answer to that, not dropping the record.
+                await record_denied("csrf", rejection.status_code)
                 return rejection
         return await call_next(request)
 

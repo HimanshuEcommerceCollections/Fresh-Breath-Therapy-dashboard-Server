@@ -23,7 +23,6 @@ import re
 import uuid
 from datetime import datetime, timezone
 
-import httpx
 from fastapi import (
     APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status,
 )
@@ -32,6 +31,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.services.audit_service import record_read
+from app.services.upload_validation import sanitize_filename
 from app.dependencies.auth import require_admin
 from app.models.import_batch import (
     ImportBatch, ImportRow, ImportRowStatus, ImportStatus,
@@ -74,13 +75,6 @@ ROW_SEVERITY = {
     ImportRowStatus.CREATE.value: 4,
     ImportRowStatus.SKIP.value: 5,     # nothing changes; least interesting
 }
-
-_SHEETS_ID = re.compile(r"docs\.google\.com/spreadsheets/d/([a-zA-Z0-9-_]+)")
-# Google puts the active tab in the URL fragment ("#gid=123456789"). Without
-# this the export silently returns the FIRST tab, so an admin who copied the
-# link while looking at tab three would import tab one and never be told.
-_SHEETS_GID = re.compile(r"[#&?]gid=(\d+)")
-
 
 # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -267,48 +261,6 @@ def _saved_row_decisions(batch: ImportBatch) -> dict[str, dict[str, str]]:
     return (batch.fk_resolutions or {}).get("rows", {})
 
 
-async def _fetch_linked_sheet(url: str) -> tuple[bytes, str]:
-    """Pull a Google Sheet the admin pasted a link to.
-
-    Uses the CSV export endpoint, which requires the sheet to be readable by
-    the link. That is a real limitation and a deliberate one to surface:
-    link-shared PHI is not something to encourage silently.
-
-    TODO(service-account): the production path is a Google service account
-    with the sheet shared to its address — no link-sharing, and it also
-    unlocks writing the reference column back into the sheet. Needs
-    GOOGLE_SERVICE_ACCOUNT_JSON in config before it can be wired up.
-    """
-    match = _SHEETS_ID.search(url)
-    if not match:
-        raise HTTPException(
-            status_code=422,
-            detail="That doesn't look like a Google Sheets link.",
-        )
-    export = (
-        f"https://docs.google.com/spreadsheets/d/{match.group(1)}/export?format=csv"
-    )
-    gid = _SHEETS_GID.search(url)
-    if gid:
-        export += f"&gid={gid.group(1)}"
-    try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
-            response = await client.get(export)
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"Couldn't reach the sheet: {exc}")
-
-    content_type = response.headers.get("content-type", "")
-    if response.status_code != 200 or "text/html" in content_type:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "The sheet isn't readable. In Google Sheets choose Share → "
-                "General access → Anyone with the link (Viewer), then try again."
-            ),
-        )
-    return response.content, "linked-sheet.csv"
-
-
 # ── entity picker ─────────────────────────────────────────────────────────
 
 @router.get("/entities", response_model=list[EntityInfo])
@@ -371,34 +323,43 @@ async def list_entities(
              status_code=status.HTTP_201_CREATED)
 async def create_import(
     entity: str = Form(...),
-    file: UploadFile | None = File(default=None),
-    source_url: str | None = Form(default=None),
+    file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_admin()),
 ):
-    """Upload a sheet (or link one) and get a proposed mapping back.
+    """Upload a spreadsheet and get a proposed mapping back.
 
-    Writes only to import_rows. The file itself is parsed in memory and never
+    Writes only to import_rows. The file is parsed in memory and never
     persisted to blob storage — it contains PHI, and Cloudinary (where this
     app's other uploads go) isn't covered for that.
+
+    UPLOAD ONLY. Pasting a Google Sheets link used to be accepted here and was
+    fetched through the sheet's public CSV export endpoint — which requires the
+    sheet to be set to "anyone with the link can view". So the documented way to
+    import client records was to publish a spreadsheet of them to the open web
+    and leave it published. The alternative was a Google service account, which
+    needs its own credentials and a Workspace BAA; FBT's call was to drop the
+    feature, since uploaded files already do the same job and require nobody to
+    expose anything.
+
+    Removing it also closed a small server-side request surface: the backend no
+    longer fetches a URL supplied in a request body.
     """
     try:
         get_entity(entity)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
-    if file is not None:
-        content = await file.read()
-        if len(content) > MAX_UPLOAD_BYTES:
-            raise HTTPException(
-                status_code=413,
-                detail=f"File is larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
-            )
-        filename = file.filename or "upload.csv"
-    elif source_url:
-        content, filename = await _fetch_linked_sheet(source_url)
-    else:
-        raise HTTPException(status_code=422, detail="Provide a file or a sheet link.")
+    content = await file.read()
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File is larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
+        )
+    # Sanitised before it is stored and rendered in the import history table.
+    # Never used as a path, so this is not traversal — but control characters
+    # and unbounded length have no business in a database column either.
+    filename = sanitize_filename(file.filename)
 
     try:
         sheet = parse_sheet(content, filename)
@@ -411,7 +372,8 @@ async def create_import(
         id=uuid.uuid4(),
         entity=entity,
         filename=filename,
-        source_url=source_url,
+        # Left null. The column remains for batches created while link-import
+        # existed; nothing sets it any more.
         status=ImportStatus.MAPPING.value,
         column_mapping=proposal.as_mapping(),
         # Persisted so every later GET can render the mapping screen. Without
@@ -453,6 +415,10 @@ async def get_import(
     current_user: User = Depends(require_admin()),
 ):
     batch = await _get_batch(db, batch_id)
+    # The detail payload carries per-column SAMPLE VALUES lifted from the
+    # sheet, so this is a PHI read and not just metadata.
+    await record_read(db, "import_batch", entity_id=batch.id,
+                      criteria={"view": "detail"})
     return await _batch_detail(db, batch)
 
 
@@ -479,7 +445,7 @@ async def list_batch_rows(
         query = query.where(ImportRow.status.in_(wanted))
 
     result = await db.execute(query.order_by(ImportRow.row_number).limit(limit))
-    return [
+    previews = [
         RowPreview(
             row_number=row.row_number,
             status=row.status,
@@ -492,6 +458,14 @@ async def list_batch_rows(
         )
         for row in result.scalars().all()
     ]
+    # Every cell of the uploaded spreadsheet, verbatim — the least filtered
+    # PHI this API returns anywhere.
+    await record_read(
+        db, "import_row", entity_id=batch_id,
+        count=len(previews),
+        criteria={"view": "rows", "batch_id": str(batch_id)},
+    )
+    return previews
 
 
 @router.patch("/{batch_id}/mapping", response_model=ImportBatchDetail)
@@ -1297,7 +1271,13 @@ async def list_imports(
     if entity:
         query = query.where(ImportBatch.entity == entity)
     result = await db.execute(query)
-    return list(result.scalars().all())
+    batches = list(result.scalars().all())
+    await record_read(
+        db, "import_batch",
+        entity_ids=[b.id for b in batches],
+        criteria={"entity": entity, "limit": limit},
+    )
+    return batches
 
 
 @router.delete("/{batch_id}", status_code=status.HTTP_204_NO_CONTENT)

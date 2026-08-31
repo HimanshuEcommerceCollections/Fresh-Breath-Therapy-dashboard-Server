@@ -187,7 +187,11 @@ async def _create_or_get_lead(payload: LeadWebhookPayload, db: AsyncSession) -> 
             return LeadWebhookResult(status="already_received", lead_id=already.id, duplicate=True)
         raise
 
-    logger.info("Lead received from website webhook: %s (%s)", lead.id, payload.email)
+    # The lead id only. This line used to include payload.email, putting an
+    # enquirer's address into application logs on every single submission —
+    # the highest-volume PHI leak in the system. The address is in the leads
+    # table, which is access-controlled and audited; the log is neither.
+    logger.info("Lead received from website webhook: %s", lead.id)
     return LeadWebhookResult(
         status="created", lead_id=lead.id, duplicate=False,
         location_created=location_created,

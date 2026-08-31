@@ -21,13 +21,18 @@ from app.services.otp_service import (
     OTP_TTL_MINUTES, request_otp, resolve_ticket, verify_otp,
 )
 from app.schemas.otp import (
-    OtpRequestResponse, ResendOtpRequest, VerifyOtpRequest, VerifyOtpResponse,
+    OtpRequestResponse, PendingLoginResponse, ResendOtpRequest, VerifyOtpRequest,
+    VerifyOtpResponse,
 )
 from app.config import settings
 from app.services.auth_cookie import (
     ACCESS_TOKEN_COOKIE, LOGIN_TICKET_COOKIE, clear_auth_cookie,
     clear_login_ticket_cookie, set_auth_cookie, set_login_ticket_cookie,
 )
+from app.services.audit_service import (
+    record_login, record_logout, recent_failed_logins,
+)
+from app.services.jwt_service import decode_token_claims
 from app.services.token_revocation_service import revoke_token
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -53,6 +58,20 @@ def _assert_may_hold_session(user: User) -> None:
         raise HTTPException(status_code=403, detail="Account pending admin approval")
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account is inactive")
+
+
+def _mask_email(email: str) -> str:
+    """"kristen@fbtclinic.com" -> "k*****@fbtclinic.com".
+
+    Enough for someone to recognise which inbox to check, not enough to be a
+    disclosure if it is screenshotted, cached or logged. The domain is kept
+    because that is what tells a user they used the wrong account.
+    """
+    local, _, domain = email.partition("@")
+    if not domain:
+        return "*" * len(email)
+    head = local[:1] if local else ""
+    return f"{head}{'*' * max(len(local) - 1, 1)}@{domain}"
 
 
 def _assert_ticket_matches_email(user: User, claimed_email: str) -> None:
@@ -83,9 +102,34 @@ async def login(
     user = result.scalar_one_or_none()
 
     if user is None or user.password_hash is None:
+        # Only the DOMAIN is recorded, never the address. The address behind a
+        # failed attempt is the one field that would make this table useful to
+        # whoever reached it; the domain still distinguishes "someone is
+        # spraying our staff" from "one person mistyped".
+        await record_login(db, user.id if user else None, success=False,
+                           email_domain=credentials.email.rsplit("@", 1)[-1])
         raise HTTPException(status_code=401, detail="Please sign in with Google for this account")
 
+    # Account lockout BEFORE the password is checked, so a locked account costs
+    # an attacker one indexed count instead of a bcrypt verification — which is
+    # also what stops the endpoint being used as a CPU sink.
+    #
+    # Deliberately not revealing that the account is locked, only that it is
+    # rate limited; "this account exists and is under attack" is not something
+    # to confirm to whoever is attacking it.
+    failures = await recent_failed_logins(
+        db, user.id, settings.FAILED_LOGIN_WINDOW_MINUTES
+    )
+    if failures >= settings.MAX_FAILED_LOGINS:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed attempts. Please wait a few minutes and try again.",
+            headers={"Retry-After": str(settings.FAILED_LOGIN_WINDOW_MINUTES * 60)},
+        )
+
     if not verify_password(credentials.password, user.password_hash):
+        await record_login(db, user.id, success=False,
+                           email_domain=credentials.email.rsplit("@", 1)[-1])
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
 
     if user.role_id is None:
@@ -98,6 +142,7 @@ async def login(
         # this is the only place a session can be minted. No ticket is issued,
         # which is precisely why /verify-login-otp cannot mint one either.
         _set_access_token_cookie(response, user.id)
+        await record_login(db, user.id, success=True)
         return OtpRequestResponse(detail="Login successful", otp_required=False)
 
     # The password verified above is what earns the ticket. Everything the OTP
@@ -133,7 +178,8 @@ async def verify_login_otp(
     otp = await verify_otp(db, ticket, purpose="login", code=payload.code)
     user = otp.user  # loaded with .role by resolve_ticket
 
-    _assert_ticket_matches_email(user, payload.email)
+    if payload.email is not None:
+        _assert_ticket_matches_email(user, payload.email)
     _assert_may_hold_session(user)
 
     # Spend the ticket before handing out the session: one login attempt, one
@@ -141,6 +187,7 @@ async def verify_login_otp(
     # browser afterwards.
     clear_login_ticket_cookie(response)
     _set_access_token_cookie(response, user.id)
+    await record_login(db, user.id, success=True)
     # The user rides back with the verification so the client can populate its
     # session cache and route straight to the dashboard. An account with no
     # role yet is still pending approval, so there is nothing useful to send.
@@ -194,6 +241,51 @@ async def resend_otp(
     return OtpRequestResponse(expires_at=expires_at)
 
 
+@router.get("/pending-login", response_model=PendingLoginResponse)
+async def get_pending_login(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """What the OTP screen needs, without putting it in a URL.
+
+    The address used to be passed as /verify-otp?email=..., which lands in
+    platform access logs, browser history and any referrer — audit item 4.4.
+    The login ticket already identifies the attempt, so the page can ask for
+    what it needs instead of carrying it.
+
+    Returns a MASKED address. The screen only has to say which inbox to check;
+    it never needs the whole thing, and a masked value is harmless in a
+    screenshot or a cache.
+
+    Authenticated by the ticket alone, which is the point — there is no session
+    yet at this stage.
+    """
+    ticket = request.cookies.get(LOGIN_TICKET_COOKIE)
+
+    # One endpoint serves both flows, so the client does not have to know which
+    # kind of ticket it is holding. resolve_ticket RAISES rather than returning
+    # None, hence the try/except rather than a truthiness check.
+    otp = None
+    for purpose in ("login", "signup"):
+        try:
+            otp = await resolve_ticket(db, ticket, purpose)
+            break
+        except HTTPException:
+            continue
+
+    if otp is None:
+        raise HTTPException(
+            status_code=401,
+            detail="This login session is no longer valid. Please sign in again.",
+        )
+
+    return PendingLoginResponse(
+        email_masked=_mask_email(otp.user.email),
+        expires_at=otp.expires_at,
+        purpose=otp.purpose,
+    )
+
+
 @router.get("/me", response_model=UserResponse)
 async def get_me(current_user: User = Depends(get_current_user)):
     return current_user
@@ -207,6 +299,12 @@ async def logout(request: Request, response: Response, db: AsyncSession = Depend
     token = request.cookies.get(ACCESS_TOKEN_COOKIE)
     if token:
         await revoke_token(db, token)
+    claims = decode_token_claims(token) if token else None
+    try:
+        user_id = uuid.UUID(claims["sub"]) if claims and claims.get("sub") else None
+    except (KeyError, ValueError):
+        user_id = None
+    await record_logout(db, user_id)
     clear_auth_cookie(response)
     return {"detail": "Logged out"}
 
@@ -269,12 +367,40 @@ async def verify_signup_otp(
     # success for an email it never checked.
     ticket = request.cookies.get(LOGIN_TICKET_COOKIE)
     otp = await verify_otp(db, ticket, purpose="signup", code=payload.code)
-    _assert_ticket_matches_email(otp.user, payload.email)
+    if payload.email is not None:
+        _assert_ticket_matches_email(otp.user, payload.email)
 
     # No session is minted here — the account is still pending admin approval —
     # but the spent ticket still gets cleared out of the browser.
     clear_login_ticket_cookie(response)
     return VerifyOtpResponse(detail="Email verified. Awaiting admin approval.")
+
+
+@router.post("/users/{user_id}/revoke-sessions", status_code=status.HTTP_204_NO_CONTENT)
+async def revoke_user_sessions(
+    user_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin()),
+):
+    """Sign an account out of every device, immediately.
+
+    The break-glass control for a lost laptop or a departure. /logout only ever
+    revoked the one token that called it, so there was previously no answer to
+    "end this person's sessions now" other than waiting out the expiry.
+
+    One timestamp does it: get_current_user refuses any token issued earlier.
+    That covers every device at once and cannot miss one, because there is no
+    list to enumerate and therefore no list to get wrong.
+
+    Audited automatically — this is an UPDATE to a registered model, so the
+    write listener records who did it and to whom.
+    """
+    target = await db.get(User, user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    target.sessions_revoked_at = datetime.now(timezone.utc)
+    await db.commit()
 
 
 @router.get("/role-requests", response_model=list[RoleRequestResponse])

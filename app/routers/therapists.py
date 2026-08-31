@@ -15,7 +15,9 @@ from app.models.pto_transaction import PtoTransaction
 from app.models.enums import ClientStatus
 from app.schemas.therapist import TherapistCreate, TherapistUpdate, TherapistResponse
 from app.models.user import User
-from app.dependencies.auth import get_current_user, require_admin
+from app.dependencies.auth import get_current_user, get_own_therapist, require_admin
+from app.services.audit_service import record_denied_on, record_read
+from app.services.cloudinary_service import delete_avatar, upload_avatar
 
 router = APIRouter(prefix="/api/therapists", tags=["therapists"])
 
@@ -62,8 +64,27 @@ async def list_therapists(
     location_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    own_therapist: Therapist | None = Depends(get_own_therapist),
 ):
+    """The staff roster — scoped to the caller's own record for a Therapist.
+
+    This used to return every therapist to every role: name, email, phone,
+    credential, specialisation and employment status, to anyone who could log
+    in. Minimum necessary (item 2.3) says a therapist needs their own caseload,
+    not their colleagues' contact and employment details, and FBT confirmed
+    that reading.
+
+    Scoped rather than refused, deliberately. The sessions page builds its
+    therapist filter from this endpoint and a Therapist can reach that page, so
+    a 403 would break a screen they are entitled to use. One entry is also the
+    honest answer for them: their session list is already filtered to
+    themselves, so a filter offering anyone else was never meaningful.
+    """
     query = select(Therapist).options(selectinload(Therapist.location))
+    if current_user.role.name == "Therapist":
+        if own_therapist is None:
+            raise HTTPException(status_code=403, detail="No therapist record linked to this account")
+        query = query.where(Therapist.id == own_therapist.id)
     if location_id:
         query = query.where(Therapist.location_id == location_id)
     # Active therapists first, alphabetical within each group. An inactive
@@ -73,7 +94,11 @@ async def list_therapists(
         query.order_by(Therapist.is_active.desc(), Therapist.name)
     )
     therapists = result.scalars().all()
-    return await _attach_computed_fields(db, therapists)
+    responses = await _attach_computed_fields(db, therapists)
+    # Unpaginated: every therapist record in one response, so the whole staff
+    # roster is one read event.
+    await record_read(db, "therapist", entity_ids=[t.id for t in therapists])
+    return responses
 
 
 @router.get("/{therapist_id}", response_model=TherapistResponse)
@@ -81,6 +106,7 @@ async def get_therapist(
     therapist_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    own_therapist: Therapist | None = Depends(get_own_therapist),
 ):
     result = await db.execute(
         select(Therapist).options(selectinload(Therapist.location)).where(Therapist.id == therapist_id)
@@ -88,7 +114,17 @@ async def get_therapist(
     therapist = result.scalar_one_or_none()
     if therapist is None:
         raise HTTPException(status_code=404, detail="Therapist not found")
+
+    # Same shape as the client/lead/session ownership checks: 404 rather than
+    # 403, so the response does not confirm a record exists, and recorded
+    # before raising because a 404 is invisible to the exception handler.
+    if current_user.role.name == "Therapist" and (
+        own_therapist is None or therapist.id != own_therapist.id
+    ):
+        await record_denied_on(db, "therapist", entity_id=therapist_id)
+        raise HTTPException(status_code=404, detail="Therapist not found")
     responses = await _attach_computed_fields(db, [therapist])
+    await record_read(db, "therapist", entity_id=therapist.id)
     return responses[0]
 
 
@@ -186,6 +222,18 @@ async def delete_therapist(
     await db.execute(
         delete(PtoTransaction).where(PtoTransaction.therapist_id == therapist_id)
     )
+
+    # Their photograph goes with the record. Nothing used to remove it, so a
+    # deleted therapist's image stayed publicly readable in object storage
+    # indefinitely (audit item 9.1). Captured BEFORE the delete, because the
+    # attributes are gone afterwards.
+    #
+    # Storage first, then the row: delete_avatar never raises, so the worst case
+    # is a logged orphan rather than a therapist who cannot be deleted because
+    # their picture would not go away.
+    storage_key, avatar_url = therapist.avatar_storage_key, therapist.avatar_url
+    await delete_avatar(storage_key, avatar_url=avatar_url)
+
     await db.delete(therapist)
     await db.commit()
 
@@ -200,9 +248,20 @@ async def upload_therapist_avatar(
     if therapist is None:
         raise HTTPException(status_code=404, detail="Therapist not found")
 
-    url = await upload_avatar(file, folder="fbt/therapists")
+    # Remember what is being replaced before overwriting the columns.
+    previous_key, previous_url = therapist.avatar_storage_key, therapist.avatar_url
+
+    url, storage_key = await upload_avatar(file, folder="fbt/therapists")
     therapist.avatar_url = url
+    therapist.avatar_storage_key = storage_key
     await db.commit()
+
+    # AFTER the new one is safely stored and committed, not before: if this
+    # order were reversed and the upload failed, the therapist would be left
+    # with no photograph at all. Every re-upload previously orphaned the
+    # previous image, so this leaked one file per edit.
+    if previous_key or previous_url:
+        await delete_avatar(previous_key, avatar_url=previous_url)
 
     result = await db.execute(
         select(Therapist).options(selectinload(Therapist.location)).where(Therapist.id == therapist_id)

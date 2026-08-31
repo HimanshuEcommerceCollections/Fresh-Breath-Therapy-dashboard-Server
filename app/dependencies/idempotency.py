@@ -11,9 +11,11 @@ from app.models.idempotency_key import IdempotencyKey
 
 IDEMPOTENCY_HEADER = "Idempotency-Key"
 
-# TODO(retention): idempotency_keys rows only need to live ~24h (Stripe keeps
-# theirs for 24h). No cleanup job exists yet — when a scheduled-job mechanism
-# is added, run: DELETE FROM idempotency_keys WHERE created_at < now() - interval '24 hours'
+# RETENTION: these rows hold FULL SERIALISED RESPONSES, so a stored client
+# creation is a complete copy of that client's record. Purged after
+# IDEMPOTENCY_KEY_RETENTION_HOURS (24h, matching Stripe) by the daily sweep in
+# services/retention_service.py. Anything beyond the replay window is a second
+# copy of the client database kept for no reason.
 
 
 def idempotent(response_model=None, status_code: int = 200):

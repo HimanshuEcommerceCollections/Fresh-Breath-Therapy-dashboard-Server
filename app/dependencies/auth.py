@@ -1,21 +1,32 @@
 import uuid
-from fastapi import Depends, HTTPException, status
+from datetime import datetime, timedelta, timezone
+
+from fastapi import Depends, HTTPException, Response, status
 from fastapi.security import APIKeyCookie
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import literal, select
 from sqlalchemy.orm import joinedload, selectinload
 
+from app.config import settings
 from app.database import get_db
 from app.models.revoked_token import RevokedToken
 from app.models.user import User
 from app.models.therapist import Therapist
-from app.services.jwt_service import decode_token_claims
+from app.services.audit_context import set_actor
+from app.services.jwt_service import (
+    claim_as_datetime, create_access_token, decode_token_claims,
+)
+from app.services.auth_cookie import set_auth_cookie
 from app.services.token_revocation_service import is_token_revoked
 
 cookie_scheme = APIKeyCookie(name="access_token", auto_error=False)
 
 
+SESSION_EXPIRED_DETAIL = "Session expired. Please sign in again."
+
+
 async def get_current_user(
+    response: Response,
     access_token: str | None = Depends(cookie_scheme),
     db: AsyncSession = Depends(get_db),
 ) -> User:
@@ -65,8 +76,66 @@ async def get_current_user(
     if user is None or not user.is_active:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
 
+    # ── sliding idle window, with an absolute ceiling ─────────────────────
+    #
+    # The token's own expiry IS the idle timeout. Re-issuing it while the user
+    # is active means the session survives as long as they keep working and
+    # dies ACCESS_TOKEN_EXPIRE_MINUTES after they stop — which is what
+    # "automatic logoff after 30 minutes idle" actually means to a person.
+    #
+    # Doing it this way needs no `last_activity_at` column, and therefore no
+    # database write on every request, and therefore no audit-log entry per
+    # request per user. The token is the activity record.
+    #
+    # `sst` is the real sign-in time, carried across every re-issue, so a
+    # session cannot slide indefinitely on a machine somebody walked away from
+    # with a tab polling in the background.
+    now = datetime.now(timezone.utc)
+    session_started_at = claim_as_datetime(claims, "sst")
+
+    if session_started_at is not None:
+        if now - session_started_at > timedelta(hours=settings.SESSION_ABSOLUTE_HOURS):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail=SESSION_EXPIRED_DETAIL
+            )
+
+    # Break-glass revocation. One timestamp invalidates every token issued
+    # before it, on every device, which is what a stolen laptop or a departure
+    # actually needs — logout only ever killed the single token that called it.
+    if user.sessions_revoked_at is not None:
+        token_issued_at = claim_as_datetime(claims, "iat") or session_started_at
+        # A token we cannot date is refused once revocation is in force. Failing
+        # closed matters more here than honouring an old token for a few
+        # minutes: the whole point was to end every session.
+        if token_issued_at is None or token_issued_at < user.sessions_revoked_at:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail=SESSION_EXPIRED_DETAIL
+            )
+
     if user.role_id is None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account pending admin approval")
+
+    # Re-issue only once the current token has some age on it, so an active user
+    # collects a few cookies an hour rather than one per request. Deliberately
+    # AFTER every rejection above: a token that should not be honoured must
+    # never be renewed.
+    #
+    # Tokens minted before these claims existed have no `iat`; they are left
+    # alone rather than slid, and expire inside the idle window on their own.
+    issued_at = claim_as_datetime(claims, "iat")
+    if issued_at is not None and (
+        now - issued_at > timedelta(minutes=settings.TOKEN_REISSUE_AFTER_MINUTES)
+    ):
+        set_auth_cookie(
+            response,
+            create_access_token(user.id, session_started_at=session_started_at or now),
+        )
+
+    # Every authenticated request passes through here, so this is the one place
+    # the audit layer needs to learn who is acting — no route has to remember.
+    # The role is snapshot alongside the id because it is what an investigator
+    # asks about and it may since have changed.
+    set_actor(user.id, user.role.name if user.role else None, user.name)
 
     return user
 

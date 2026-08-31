@@ -34,6 +34,14 @@ class Therapist(Base):
     )
     email: Mapped[str] = mapped_column(String, unique=True, nullable=False)
     avatar_url: Mapped[str | None] = mapped_column(String, nullable=True)
+    # The storage provider's own handle for the file — a Cloudinary public_id
+    # today, an S3 object key after the migration. Deliberately named for the
+    # concept rather than the vendor, because that is the only difference
+    # between the two.
+    #
+    # avatar_url alone cannot delete anything, which is why photos accumulated:
+    # a URL is a way to READ a file, not a way to address it for removal.
+    avatar_storage_key: Mapped[str | None] = mapped_column(String, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     ever_linked: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(

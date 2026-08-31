@@ -1,3 +1,4 @@
+import pathlib
 import re
 from pydantic_settings import BaseSettings
 
@@ -5,7 +6,19 @@ class Settings(BaseSettings):
     DATABASE_URL: str
     SECRET_KEY: str
     ALGORITHM: str = "HS256"
+    # This doubles as the IDLE window. The token is re-issued while the user is
+    # active (see dependencies/auth.py), so it only actually expires after this
+    # long with no requests at all — which is what "automatic logoff after 30
+    # minutes idle" means to the person using it.
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    # Hard ceiling regardless of activity, so a session cannot slide forever on
+    # a machine somebody left open. A shift is under 12 hours; anyone still
+    # working past it signs in again.
+    SESSION_ABSOLUTE_HOURS: int = 12
+    # Do not mint a new token on every single request — that would be a
+    # Set-Cookie on every response for no benefit. Re-issue only once the
+    # current one is this old, so a busy user gets a handful per hour.
+    TOKEN_REISSUE_AFTER_MINUTES: int = 5
     # Which deployment this process is. Defaults to the LOCKED-DOWN value on
     # purpose, which is the opposite of how these flags usually read.
     #
@@ -23,6 +36,17 @@ class Settings(BaseSettings):
     CLOUDINARY_API_SECRET: str | None = None
     GOOGLE_CLIENT_ID: str | None = None
     GOOGLE_CLIENT_SECRET: str | None = None
+    # Comma-separated Google Workspace domains permitted to sign in, e.g.
+    # "freshbreaththerapy.com".
+    #
+    # FAILS CLOSED when unset: Google sign-in is REFUSED entirely rather than
+    # allowing any Google account on earth to complete the flow and land in the
+    # pending-approval queue. That matches the two settings above — CRON_SECRET
+    # and LEAD_WEBHOOK_SECRET both refuse every request when unconfigured — and
+    # it is the same reasoning: an unset security setting must not read as
+    # "allow all". Password sign-in is unaffected, so an unset value locks
+    # nobody out of the application, only out of the Google button.
+    ALLOWED_GOOGLE_DOMAINS: str | None = None
     GOOGLE_REDIRECT_URI: str = "https://fresh-breath-therapy-dashboard-serv.vercel.app/api/auth/google/callback"
     FRONTEND_URL: str = "https://fresh-breath-therapy-dashboard-ui.vercel.app"
     # Exact origins, never a wildcard: allow_credentials=True is set in
@@ -39,13 +63,61 @@ class Settings(BaseSettings):
     SMTP_USER: str | None = None
     SMTP_PASSWORD: str | None = None
     SMTP_FROM_EMAIL: str | None = None
-    EMAIL_SERVICE: bool = False  # flip to true once SMTP is confirmed working end-to-end
+    # NO DEFAULT, deliberately. This single flag decides whether a second
+    # factor exists at all, and its old default of False was half of a full
+    # authentication bypass (see the ticket-binding work in otp_service.py).
+    # There is no safe value to guess: False silently disables 2FA, True breaks
+    # every login if SMTP is not actually working. So the operator has to say,
+    # and the app refuses to start until they do.
+    EMAIL_SERVICE: bool
     # Shared secret for the /api/internal/notification-scan route — required
     # so the AsyncIOScheduler-based scan (Render-only, see scheduler_service.py)
     # can also be triggered externally (e.g. Vercel Cron) if this ever runs
     # somewhere the in-process scheduler can't. No default: unset means the
     # route refuses every request rather than running unauthenticated.
     CRON_SECRET: str | None = None
+    # Used once, to create the very first admin when the users table is empty.
+    # Declared here rather than read with os.getenv so that every environment
+    # variable this app consumes is visible in one place — which is also what
+    # makes extra="forbid" viable.
+    INITIAL_ADMIN_EMAIL: str | None = None
+    INITIAL_ADMIN_PASSWORD: str | None = None
+    # ── brute-force lockout (item 1.9) ────────────────────────────────────
+    # Counted per ACCOUNT out of the audit log's login_failed entries, so it is
+    # exact across instances and follows the account rather than the source
+    # address. The per-IP limiter in middleware/rate_limit.py is the other half.
+    MAX_FAILED_LOGINS: int = 8
+    FAILED_LOGIN_WINDOW_MINUTES: int = 15
+
+    # ── audit log retention ───────────────────────────────────────────────
+    # HIPAA 164.316(b)(2) requires documentation to be kept six years, and
+    # audit records are treated as required documentation. Configurable rather
+    # than a constant because it is a legal/business call, not a code one —
+    # state law or an insurer may require longer, and the Settings screen
+    # currently claims seven.
+    AUDIT_RETENTION_DAYS: int = 6 * 365
+    # The purge is the only path that deletes audit rows. On by default and a
+    # no-op for six years; leaving the MECHANISM unbuilt is how this codebase
+    # ended up with three tables carrying TODO(retention) and nowhere to hang a
+    # policy.
+    AUDIT_PURGE_ENABLED: bool = True
+
+    # ── retention for the other PHI-bearing tables (item 5.7) ─────────────
+    # How long after a batch settles the spreadsheet's raw contents are kept.
+    # Long enough to investigate a bad import, short enough that years of other
+    # people's spreadsheets do not sit in the database. The row's verdict and
+    # the id it produced are kept regardless — only the PHI columns are nulled.
+    IMPORT_ROW_RETENTION_DAYS: int = 30
+    # Stored API responses exist to make a retried request safe, which is
+    # answered within seconds. Stripe keeps theirs 24 hours; anything longer is
+    # a copy of a client record for no reason.
+    IDEMPOTENCY_KEY_RETENTION_HOURS: int = 24
+    # Notification bodies name the client or lead they concern — that is what
+    # makes them useful, and with therapist scoping fixed they only reach people
+    # entitled to read the name. But a read reminder from four months ago is
+    # PHI kept for nothing, so they age out.
+    NOTIFICATION_RETENTION_DAYS: int = 90
+
     # ── pooling ───────────────────────────────────────────────────────────
     # Supabase exposes the same database three ways, and which one you use
     # decides how many clients you get:
@@ -105,7 +177,16 @@ class Settings(BaseSettings):
 
     class Config:
         env_file = ".env"
-        extra = "ignore"
+        # FORBID, not ignore. With "ignore" a misspelled variable was silently
+        # discarded: set SECRET_KEYY on the host and the app booted happily
+        # using a different key, or none. Security settings that fail quietly
+        # are worse than ones that fail loudly, so an unrecognised key in .env
+        # now stops startup instead of being swallowed.
+        #
+        # Note this only polices the .env FILE. Real environment variables are
+        # matched by field name, so the platform's own vars (PORT, RENDER_*)
+        # are never collected and cannot trip this.
+        extra = "forbid"
 
     # ── resolved connection URLs ──────────────────────────────────────────
 
@@ -113,6 +194,11 @@ class Settings(BaseSettings):
     def _with_port(url: str, port: int) -> str:
         """Swap the port in a postgres URL, leaving credentials untouched."""
         return re.sub(r"(?<=:)\d+(?=/[^/]*$)", str(port), url, count=1)
+
+    @property
+    def allowed_google_domains(self) -> set[str]:
+        raw = self.ALLOWED_GOOGLE_DOMAINS or ""
+        return {d.strip().lower() for d in raw.split(",") if d.strip()}
 
     @property
     def is_development(self) -> bool:
@@ -169,4 +255,46 @@ class Settings(BaseSettings):
         return match.group(1) if match else "unknown"
 
 
+def _assert_no_unknown_env_file_keys(path: str = ".env") -> None:
+    """Refuse to start if .env contains a key no setting will ever read.
+
+    This exists because pydantic-settings' extra="forbid" does NOT cover dotenv
+    keys here. Its DotEnvSettingsSource only raises for a key that does not
+    start with env_prefix, and our prefix is the empty string — so every key
+    "starts with" it and the check never fires. extra="forbid" is kept above
+    because it still governs values passed to the constructor directly, but it
+    is not what catches a typo in the file.
+
+    Which matters, because the failure it prevents is silent: set SECRET_KEYY
+    on a host and the old behaviour was to discard it and boot with a different
+    key, or none, with nothing in the logs. A security setting that fails
+    quietly is worse than one that fails loudly.
+
+    Only the FILE is checked. Real environment variables are matched by field
+    name, so a platform's own vars (PORT, RENDER_*, PYTHON_VERSION) are never
+    collected and must not be treated as errors.
+    """
+    env_path = pathlib.Path(path)
+    if not env_path.is_file():
+        return
+
+    known = set(Settings.model_fields)
+    unknown = []
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key and key not in known:
+            unknown.append(key)
+
+    if unknown:
+        raise RuntimeError(
+            f"{env_path} defines {len(unknown)} key(s) that no setting reads: "
+            f"{', '.join(sorted(unknown))}. Either a typo or a leftover — fix or "
+            f"remove it. Refusing to start rather than ignoring it silently."
+        )
+
+
 settings = Settings()
+_assert_no_unknown_env_file_keys()

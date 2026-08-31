@@ -21,6 +21,12 @@ class User(Base):
     )
     avatar_url: Mapped[str | None] = mapped_column(String, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Break-glass revocation: every token issued before this instant is
+    # refused, across every device, without needing a session table to
+    # enumerate. Null means "never revoked".
+    sessions_revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

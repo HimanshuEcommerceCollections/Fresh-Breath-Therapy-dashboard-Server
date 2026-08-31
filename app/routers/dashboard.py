@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, case, literal
 
 from app.database import get_db
+from app.services.audit_service import record_read
 from app.models.lead import Lead
 from app.models.client import Client
 from app.models.therapist import Therapist
@@ -231,6 +232,7 @@ async def get_dashboard(
         for row in utilization_rows
     ]
 
+    await record_read(db, "dashboard", criteria={"range": "default"})
     return DashboardResponse(
         leads=LeadStat(total=total_leads, new_this_month=new_leads),
         clients=ClientStat(active=active_clients, new_last_30_days=new_clients),

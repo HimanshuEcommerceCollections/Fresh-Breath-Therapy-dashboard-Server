@@ -1,7 +1,6 @@
 import logging
 import secrets
 import uuid
-from urllib.parse import urlencode
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
@@ -26,8 +25,26 @@ GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
 
 
+def _login_error_redirect(reason: str) -> RedirectResponse:
+    """Any failure past this point sends the browser back to the login page
+    instead of surfacing a raw JSON error — this is a full-page redirect
+    flow, not an XHR call the SPA can catch and render itself."""
+    redirect = RedirectResponse(f"{settings.FRONTEND_URL}/login?status=google_error&reason={reason}")
+    redirect.delete_cookie("oauth_state")
+    return redirect
+
+
 @router.get("/login")
 async def google_login():
+    # Checked here too, not only in the callback. Sending someone to Google and
+    # refusing them on the way back wastes their time and looks like a bug;
+    # refusing before the redirect tells them immediately.
+    if not settings.allowed_google_domains:
+        logger.error(
+            "Google sign-in refused: ALLOWED_GOOGLE_DOMAINS is not configured."
+        )
+        return _login_error_redirect("google_not_configured")
+
     state = secrets.token_urlsafe(24)
     params = {
         "client_id": settings.GOOGLE_CLIENT_ID,
@@ -43,17 +60,11 @@ async def google_login():
     redirect = RedirectResponse(f"{GOOGLE_AUTH_URL}?{query}")
     redirect.set_cookie(
         key="oauth_state", value=state, httponly=True,
-        samesite="lax", secure=False, max_age=600,
+        # secure=True: this cookie IS the CSRF protection for the Google login
+        # flow, so it must never travel over plaintext. It was False, which let
+        # a browser send it unencrypted.
+        samesite="lax", secure=True, max_age=600,
     )
-    return redirect
-
-
-def _login_error_redirect(reason: str) -> RedirectResponse:
-    """Any failure past this point sends the browser back to the login page
-    instead of surfacing a raw JSON error — this is a full-page redirect
-    flow, not an XHR call the SPA can catch and render itself."""
-    redirect = RedirectResponse(f"{settings.FRONTEND_URL}/login?status=google_error&reason={reason}")
-    redirect.delete_cookie("oauth_state")
     return redirect
 
 
@@ -96,6 +107,36 @@ async def google_callback(
         if not email or not email_verified:
             return _login_error_redirect("email_not_verified")
 
+        # Hosted-domain check. Without it any Google account can complete this
+        # flow and create a pending signup request, so rejecting strangers
+        # becomes manual work arriving by surprise.
+        #
+        # `hd` is the authoritative claim but only Workspace accounts carry it —
+        # a personal gmail.com login has none — so the address's own domain is
+        # the fallback.
+        allowed_domains = settings.allowed_google_domains
+        if not allowed_domains:
+            # FAIL CLOSED. An unconfigured allowlist previously meant "any
+            # Google account on earth", which turned rejecting strangers into
+            # manual work arriving by surprise. Refusing is the same choice
+            # CRON_SECRET and LEAD_WEBHOOK_SECRET already make when unset.
+            #
+            # Password sign-in still works, so this locks nobody out of the
+            # application — only out of the Google button, until somebody says
+            # which domains belong to the clinic.
+            logger.error(
+                "Google sign-in refused: ALLOWED_GOOGLE_DOMAINS is not configured."
+            )
+            return _login_error_redirect("google_not_configured")
+
+        hosted_domain = (profile.get("hd") or "").strip().lower()
+        email_domain = email.rsplit("@", 1)[-1].lower()
+        if hosted_domain not in allowed_domains and email_domain not in allowed_domains:
+            # The domain itself is not logged — it is an identifier, and the
+            # refusal is already recorded against the request id.
+            logger.warning("Google sign-in refused: domain not on the allowlist")
+            return _login_error_redirect("domain_not_allowed")
+
         result = await db.execute(
             select(User).options(selectinload(User.role)).where(User.email == email)
         )
@@ -130,13 +171,12 @@ async def google_callback(
             # redirect, so params carry what the login form would otherwise pass
             # via JSON) to finish the same verify-login-otp step password users go
             # through.
-            expires_at, ticket = await request_otp(db, user.id, user.email, purpose="login")
-            query = urlencode({
-                "email": user.email,
-                "flow": "login",
-                "expiresAt": expires_at.isoformat(),
-            })
-            redirect = RedirectResponse(f"{settings.FRONTEND_URL}/verify-otp?{query}")
+            _, ticket = await request_otp(db, user.id, user.email, purpose="login")
+            # No email and no expiry in the URL. This is a full-page redirect,
+            # so anything here is recorded in platform access logs and browser
+            # history (audit item 4.4); the OTP page asks
+            # GET /api/auth/pending-login for a masked address instead.
+            redirect = RedirectResponse(f"{settings.FRONTEND_URL}/verify-otp?flow=login")
             # Google asserting this identity is what earns the ticket here, in
             # place of the password check /login does. It rides as a cookie
             # rather than a query param for the obvious reason: this is a

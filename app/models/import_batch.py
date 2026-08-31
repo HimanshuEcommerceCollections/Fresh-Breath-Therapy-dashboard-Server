@@ -16,7 +16,7 @@ admin reviews the result, and only then does phase two commit.
 
 `raw_payload` holds the row exactly as it appeared in the spreadsheet, which
 means this table contains PHI. It needs a retention policy; see
-TODO(retention) below.
+the RETENTION note below.
 """
 import enum
 import uuid
@@ -186,10 +186,11 @@ class ImportBatch(Base):
 class ImportRow(Base):
     """One spreadsheet row, its verdict, and what it produced.
 
-    TODO(retention): raw_payload contains PHI. Rows should be purged (or
-    raw_payload nulled, keeping the verdict for audit) some fixed period
-    after the batch commits. Wire this into scheduler_service.py alongside
-    the existing scans once the retention window is agreed with FBT.
+    RETENTION: raw_payload contains PHI, and is redacted in place
+    IMPORT_ROW_RETENTION_DAYS after the batch settles — see
+    services/retention_service.py, run daily from scheduler_service.py. The
+    row_number, status, errors and entity_id survive redaction, because those
+    are what make an import explainable afterwards and what a rollback walks.
     """
 
     __tablename__ = "import_rows"
@@ -212,7 +213,7 @@ class ImportRow(Base):
     # NEVER edited — this is the audit trail of what the spreadsheet said.
     raw_payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
     # Corrections the admin typed on the review screen, keyed by FIELD name:
-    # {"email": "kristen.reyes@fbtclinic.com"}. Layered over raw_payload at
+    # {"email": "user@example.com"}. Layered over raw_payload at
     # validation time so a one-character typo doesn't need a round trip
     # through the spreadsheet, while leaving the original readable.
     overrides: Mapped[dict | None] = mapped_column(JSONB, nullable=True)

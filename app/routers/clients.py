@@ -16,6 +16,7 @@ from app.schemas.client import ClientCreate, ClientUpdate, ClientResponse
 from app.models.user import User
 from app.dependencies.auth import get_current_user, require_admin, get_own_therapist
 from app.dependencies.idempotency import idempotent
+from app.services.audit_service import record_denied_on, record_read
 from app.services.pagination import Page, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, apply_keyset_pagination, paginate_rows
 
 router = APIRouter(prefix="/api/clients", tags=["clients"])
@@ -86,6 +87,20 @@ async def list_clients(
     result = await db.execute(query)
     clients, next_cursor, has_more = paginate_rows(result.scalars().all(), limit)
     responses = await _attach_computed_fields(db, clients)
+    # The search term is a name/email fragment, i.e. PHI, so only the FACT of a
+    # search is recorded. Everything else about the query is safe and is what
+    # makes "148 records returned" explainable later.
+    await record_read(
+        db, "client",
+        entity_ids=[c.id for c in clients],
+        criteria={
+            "status": status_filter.value if status_filter else None,
+            "location_id": str(location_id) if location_id else None,
+            "searched": bool(search),
+            "limit": limit,
+            "paged": bool(cursor),
+        },
+    )
     return Page(items=responses, next_cursor=next_cursor, has_more=has_more)
 
 
@@ -101,8 +116,14 @@ async def get_client(
     if client is None:
         raise HTTPException(status_code=404, detail="Client not found")
     if current_user.role.name == "Therapist" and client.therapist_id != own_therapist.id:
+        # Recorded before raising: the 404 is deliberate (it refuses to confirm
+        # the record exists) but that also makes it invisible to the exception
+        # handler, and "a therapist went looking outside their caseload" is the
+        # most valuable insider signal this log can carry.
+        await record_denied_on(db, "client", entity_id=client_id)
         raise HTTPException(status_code=404, detail="Client not found")
 
+    await record_read(db, "client", entity_id=client.id)
     responses = await _attach_computed_fields(db, [client])
     return responses[0]
 
