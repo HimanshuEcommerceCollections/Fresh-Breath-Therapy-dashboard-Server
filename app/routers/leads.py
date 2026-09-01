@@ -1,7 +1,7 @@
 import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query, status, Request
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_
+from sqlalchemy import select, or_, update
 from sqlalchemy.orm import selectinload
 
 from app.database import get_db
@@ -9,6 +9,7 @@ from app.models.lead import Lead
 from app.models.location import Location
 from app.models.therapist import Therapist
 from app.models.client import Client
+from app.models.session import Session as SessionModel
 from app.models.enums import ContactStatus
 from app.schemas.lead import LeadCreate, LeadUpdate, LeadResponse
 from app.schemas.client import ClientResponse
@@ -199,6 +200,19 @@ async def convert_lead(
     )
     db.add(client)
     lead.converted_client_id = client.id
+    # Flush so the client row exists before anything is repointed at it.
+    await db.flush()
+
+    # The person's history follows them. A lead can hold sessions of their own
+    # now, so converting without moving them would leave a consultation
+    # attached to a record the admin no longer looks at, and the new client
+    # would show a session count of zero on the day they were converted.
+    await db.execute(
+        update(SessionModel)
+        .where(SessionModel.lead_id == lead.id)
+        .values(client_id=client.id, lead_id=None)
+    )
+
     await db.commit()
 
     result = await db.execute(_client_query().where(Client.id == client.id))

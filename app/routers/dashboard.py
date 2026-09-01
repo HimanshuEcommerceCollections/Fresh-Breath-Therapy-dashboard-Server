@@ -176,10 +176,20 @@ async def get_dashboard(
         FunnelStage(status=s.value, count=funnel_counts.get(s, 0)) for s in ContactStatus
     ]
 
-    # Upcoming sessions — one JOIN query, no per-row lookups
+    # Upcoming sessions — one JOIN query, no per-row lookups.
+    #
+    # OUTER joins to both clients and leads, because a session now belongs to
+    # exactly one of them. An inner join to clients — which is what this was —
+    # silently dropped every lead's session from the list, so booking a
+    # consultation for a new enquiry left the dashboard looking empty.
     upcoming_rows = (await db.execute(
-        select(SessionModel, Client.name, Therapist.name)
-        .join(Client, SessionModel.client_id == Client.id)
+        select(
+            SessionModel,
+            func.coalesce(Client.name, Lead.name),
+            Therapist.name,
+        )
+        .outerjoin(Client, SessionModel.client_id == Client.id)
+        .outerjoin(Lead, SessionModel.lead_id == Lead.id)
         .join(Therapist, SessionModel.therapist_id == Therapist.id)
         .where(SessionModel.status == SessionStatus.SCHEDULED, SessionModel.date >= today)
         .order_by(SessionModel.date, SessionModel.time)
