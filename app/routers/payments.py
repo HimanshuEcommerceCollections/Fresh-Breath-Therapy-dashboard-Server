@@ -36,8 +36,8 @@ async def list_payments(
     client_id: uuid.UUID | None = None,
     status_filter: PaymentStatus | None = None,
     method: PaymentMethod | None = None,
-    # Matched against the CLIENT's name. The admin looking for a payment knows
-    # who it was for, not its id or its date.
+    # Matched against the session subject's name — lead or client. The admin
+    # looking for a payment knows who it was for, not its id or its date.
     search: str | None = None,
     cursor: str | None = None,
     limit: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
