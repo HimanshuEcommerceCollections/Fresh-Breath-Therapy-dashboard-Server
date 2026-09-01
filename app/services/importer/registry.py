@@ -277,44 +277,6 @@ LEADS = EntitySpec(
     ),
 )
 
-PAYMENTS = EntitySpec(
-    key="payments",
-    label="Payments",
-    model=Payment,
-    depends_on=("clients",),
-    # Every field that makes one transaction distinguishable from another.
-    # Two payments from the same client, on the same day, for the same amount,
-    # by the same method are one payment entered twice — a real second payment
-    # differs in at least one of these.
-    natural_key=("client", "date", "amount", "method"),
-    supports_update=False,
-    fields=(
-        FieldSpec("client", "Client", FieldKind.FK, required=True,
-                  fk_entity="clients",
-                  aliases=("client name", "patient", "paid by")),
-        FieldSpec("amount", "Amount", FieldKind.MONEY, required=True,
-                  aliases=("amount paid", "payment", "paid", "fee", "charge",
-                           "transaction amount", "sum", "price")),
-        FieldSpec("date", "Payment date", FieldKind.DATE, required=True,
-                  aliases=("paid on", "transaction date", "date paid",
-                           "payment date", "received")),
-        FieldSpec("method", "Method", FieldKind.ENUM, required=True,
-                  enum_cls=PaymentMethod,
-                  aliases=("payment method", "paid via", "mode",
-                           "payment type", "via", "coverage")),
-        # INSERT_ONLY, matching every other workflow status in this registry:
-        # the sheet says where a historical payment ended up, but an admin
-        # working in the dashboard owns it from then on.
-        FieldSpec("status", "Status", FieldKind.ENUM,
-                  writable=Writability.INSERT_ONLY, enum_cls=PaymentStatus,
-                  aliases=("payment status", "paid?", "settled", "state")),
-    ),
-    notes=(
-        "Append-only. A transaction that already exists is skipped rather "
-        "than edited.",
-    ),
-)
-
 SESSIONS = EntitySpec(
     key="sessions",
     label="Sessions",
@@ -342,6 +304,31 @@ SESSIONS = EntitySpec(
         FieldSpec("status", "Status", FieldKind.ENUM,
                   writable=Writability.INSERT_ONLY, enum_cls=SessionStatus,
                   aliases=("session status", "attendance", "outcome", "result")),
+        # ── the session's payment ─────────────────────────────────────────
+        # Not columns on `sessions`. A payment cannot exist without a session,
+        # so it has no sheet of its own: the money travels on the session row
+        # that earned it, exactly as it does when an admin schedules one.
+        # _insert_records writes the payment rows after the sessions.
+        #
+        # All three are optional together. A sheet with no money columns
+        # imports sessions with no payments, which is what a historical
+        # attendance register is.
+        FieldSpec("payment_amount", "Amount", FieldKind.MONEY,
+                  aliases=("payment", "paid", "fee", "charge", "cost",
+                           "price", "session fee", "amount paid")),
+        FieldSpec("payment_method", "Payment method", FieldKind.ENUM,
+                  enum_cls=PaymentMethod,
+                  aliases=("method", "paid via", "coverage", "payment type",
+                           "billing", "billed to")),
+        FieldSpec("payment_status", "Payment status", FieldKind.ENUM,
+                  writable=Writability.INSERT_ONLY, enum_cls=PaymentStatus,
+                  aliases=("paid?", "settled", "payment state")),
+    ),
+    notes=(
+        "Money columns are optional. Map them and each session gets its "
+        "payment; leave them unmapped and the sessions import with none.",
+        "An amount with no method is rejected — a payment has to say who is "
+        "covering it.",
     ),
 )
 
@@ -394,7 +381,7 @@ FOLLOW_UPS = EntitySpec(
 #
 ENTITY_ORDER: tuple[str, ...] = (
     "locations", "therapists", "clients",
-    "leads", "payments", "sessions", "follow_ups",
+    "leads", "sessions", "follow_ups",
 )
 
 # Advisory-lock slots. STRICTLY APPEND-ONLY, and deliberately separate from
@@ -405,9 +392,9 @@ ENTITY_ORDER: tuple[str, ...] = (
 # different locks for the same table. ENTITY_ORDER, by contrast, has to shrink
 # when an entity is retired, because callers do REGISTRY[key] over it.
 #
-# So retired entities keep their slots forever. "packages" and "enrollments"
-# are gone from the product; their positions stay here so that clients, leads,
-# payments and the rest keep the lock ids they already had.
+# So retired entities keep their slots forever. "packages", "enrollments" and
+# "payments" no longer import on their own; their positions stay here so that
+# clients, leads, sessions and the rest keep the lock ids they already had.
 _LOCK_SLOTS: tuple[str, ...] = (
     "locations", "therapists", "packages", "clients",
     "leads", "enrollments", "payments", "sessions", "follow_ups",
@@ -416,7 +403,7 @@ _LOCK_SLOTS: tuple[str, ...] = (
 REGISTRY: dict[str, EntitySpec] = {
     spec.key: spec
     for spec in (LOCATIONS, THERAPISTS, CLIENTS,
-                 LEADS, PAYMENTS, SESSIONS, FOLLOW_UPS)
+                 LEADS, SESSIONS, FOLLOW_UPS)
 }
 
 

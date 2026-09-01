@@ -7,6 +7,7 @@ from app.database import get_db
 from app.models.session import Session
 from app.models.client import Client
 from app.models.lead import Lead
+from app.models.payment import Payment
 from app.models.therapist import Therapist
 from app.models.enums import SessionStatus
 from app.schemas.session import (
@@ -30,6 +31,7 @@ def _session_query():
         selectinload(Session.client),
         selectinload(Session.lead),
         selectinload(Session.therapist),
+        selectinload(Session.payment),
     )
 
 
@@ -154,8 +156,31 @@ async def create_session(
 
     await check_double_booking(db, payload.therapist_id, payload.date, payload.time)
 
-    session = Session(id=uuid.uuid4(), **payload.model_dump())
+    # ── session + payment, one transaction ────────────────────────────────
+    #
+    # Booking an appointment and recording what it costs are one action. Both
+    # rows are added and committed together, so a payment that fails to write
+    # takes the session with it and the admin retries a whole booking rather
+    # than discovering an unbilled session later.
+    #
+    # Nothing here needs a try/except: any error escaping this handler leaves
+    # the transaction uncommitted, and get_db rolls it back. The atomicity
+    # comes from the single commit, not from catching anything.
+    session_fields = payload.model_dump(exclude={"payment"})
+    session = Session(id=uuid.uuid4(), **session_fields)
     db.add(session)
+
+    session.payment = Payment(
+        id=uuid.uuid4(),
+        amount=payload.payment.amount,
+        method=payload.payment.method,
+        status=payload.payment.status,
+        # Dated to the session rather than taken from the caller: a payment
+        # for an appointment is dated to that appointment, and a second date
+        # field could only ever contradict it.
+        date=payload.date,
+        created_by=current_user.id,
+    )
 
     if session.status == SessionStatus.COMPLETED:
         await accrue_pto_for_completed_session(db, session.id, session.therapist_id)

@@ -210,6 +210,24 @@ def normalize_row(
                 "message": f"{spec.label} is required but no column is mapped to it",
             })
 
+    # Cross-field rule: a session's payment columns are optional as a GROUP,
+    # but an amount with nobody covering it is not a payment. Caught here so
+    # the admin sees it on the review screen, before anything is written —
+    # _insert_session_payments raises on the same condition, but by then the
+    # row has already cost a failed chunk.
+    if entity.key == "sessions":
+        has_amount = normalized.get("payment_amount") not in (None, "")
+        has_method = bool(normalized.get("payment_method"))
+        if has_amount and not has_method:
+            errors.append({
+                "field": "payment_method", "column": None,
+                "message": (
+                    "This session has a payment amount but no payment method. "
+                    "Map a method column, or leave the amount unmapped to "
+                    "import the session without a payment."
+                ),
+            })
+
     return normalized, errors
 
 

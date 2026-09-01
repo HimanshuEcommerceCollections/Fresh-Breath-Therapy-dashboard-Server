@@ -36,10 +36,11 @@ async def _attach_computed_fields(db: AsyncSession, clients: list[Client]) -> li
     client_ids = [c.id for c in clients]
 
     payment_rows = await db.execute(
-        select(Payment.client_id, func.coalesce(func.sum(Payment.amount), 0))
-        .where(Payment.client_id.in_(client_ids),
+        select(SessionModel.client_id, func.coalesce(func.sum(Payment.amount), 0))
+        .join(SessionModel, Payment.session_id == SessionModel.id)
+        .where(SessionModel.client_id.in_(client_ids),
                Payment.status.in_(COLLECTED_STATUSES))
-        .group_by(Payment.client_id)
+        .group_by(SessionModel.client_id)
     )
     lifetime_values = {row[0]: row[1] for row in payment_rows.all()}
 

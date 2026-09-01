@@ -20,6 +20,7 @@ from app.models.enums import (
     COLLECTED_STATUSES, OUTSTANDING_STATUSES,
 )
 from app.models.payment import Payment
+from app.models.session import Session as SessionModel
 from app.models.user import User
 from app.dependencies.auth import require_admin_or_coordinator
 from app.services.audit_service import record_export
@@ -182,14 +183,20 @@ async def export_payments(
     if method:
         query = query.where(Payment.method == method)
     if client_id:
-        query = query.where(Payment.client_id == client_id)
+        query = query.where(
+            Payment.session_id.in_(
+                select(SessionModel.id).where(SessionModel.client_id == client_id)
+            )
+        )
 
     result = await db.execute(query.order_by(Payment.date.desc()))
     payments = result.scalars().all()
 
-    headers = ["Client", "Amount (USD)", "Method", "Status", "Date"]
+    # "Patient", not "Client": a payment can be for a lead's consultation.
+    headers = ["Patient", "Type", "Amount (USD)", "Method", "Status", "Date"]
     rows = [[
-        p.client.name if p.client else "",
+        p.session.subject.name if p.session and p.session.subject else "",
+        p.session.subject_kind.title() if p.session else "",
         _num(p.amount),
         METHOD_LABELS.get(p.method, p.method.value),
         STATUS_LABELS.get(p.status, p.status.value),

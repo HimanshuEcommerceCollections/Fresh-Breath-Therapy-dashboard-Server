@@ -4,6 +4,7 @@ from typing import Literal, Self
 from pydantic import BaseModel, model_validator
 from app.schemas.base import ORMBase
 from app.models.enums import SessionType, SessionStatus
+from app.schemas.payment import PaymentDetails, PaymentResponse
 
 TERMINAL_STATUSES = {SessionStatus.COMPLETED, SessionStatus.CANCELLED, SessionStatus.NO_SHOW}
 
@@ -33,6 +34,11 @@ class SessionCreate(_OneSubject):
     time: time_type
     type: SessionType
     status: SessionStatus = SessionStatus.SCHEDULED
+    # REQUIRED, not optional. Scheduling and recording the payment are one
+    # action: a session always costs something, and the alternative to a
+    # required block is a stream of sessions nobody ever went back to bill.
+    # An unpaid session is `status: pending`, not an absent payment.
+    payment: PaymentDetails
 
 
 class SessionUpdate(BaseModel):
@@ -94,6 +100,10 @@ class SessionResponse(ORMBase):
     updated_at: datetime
     subject: SubjectBrief
     therapist: TherapistBrief
+    # Always present on a session created through the API. Optional only
+    # because sessions imported from a spreadsheet before this existed, and
+    # any the importer writes without payment columns, have none.
+    payment: PaymentResponse | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -111,6 +121,7 @@ class SessionResponse(ORMBase):
             "type": data.type, "status": data.status,
             "created_at": data.created_at, "updated_at": data.updated_at,
             "therapist": data.therapist,
+            "payment": getattr(data, "payment", None),
             "subject": {
                 "id": person.id, "name": person.name, "kind": data.subject_kind,
             },

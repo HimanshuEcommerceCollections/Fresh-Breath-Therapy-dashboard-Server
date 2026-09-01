@@ -76,6 +76,12 @@ class Session(Base):
     client: Mapped["Client | None"] = relationship()
     lead: Mapped["Lead | None"] = relationship()
     therapist: Mapped["Therapist"] = relationship()
+    # uselist=False: one payment per session, enforced by the unique constraint
+    # on payments.session_id. delete-orphan so removing a session takes its
+    # payment with it through the ORM as well as through ON DELETE CASCADE.
+    payment: Mapped["Payment | None"] = relationship(
+        back_populates="session", uselist=False, cascade="all, delete-orphan"
+    )
 
     @property
     def subject(self):

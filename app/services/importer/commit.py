@@ -36,7 +36,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models.enums import PtoTransactionType, SessionStatus
+from app.models.enums import PaymentStatus, PtoTransactionType, SessionStatus
 from app.models.pto_transaction import PtoTransaction
 from app.services.pto_service import ACCRUAL_RATE
 from app.models.import_batch import ImportBatch, ImportRow, ImportRowStatus, ImportStatus
@@ -305,10 +305,22 @@ def _coerce(model, name: str, value):
     return value
 
 
+# Fields that live on a DIFFERENT table from the entity being imported.
+# Sessions carry their payment's columns (see registry.SESSIONS), because a
+# payment cannot exist without a session and so has no sheet of its own.
+# _model_kwargs must not hand these to the Session constructor.
+SATELLITE_FIELDS: dict[str, frozenset[str]] = {
+    "sessions": frozenset({"payment_amount", "payment_method", "payment_status"}),
+}
+
+
 def _model_kwargs(entity, values: dict) -> dict:
     """Normalized field values -> model constructor kwargs."""
+    satellites = SATELLITE_FIELDS.get(entity.key, frozenset())
     kwargs = {}
     for spec in entity.fields:
+        if spec.name in satellites:
+            continue
         if spec.name not in values or spec.writable is Writability.NEVER:
             continue
         value = values[spec.name]
@@ -506,10 +518,54 @@ async def _insert_records(
         await db.execute(insert(ctx.entity.model), group)
 
     if ctx.entity.key == "sessions":
+        # `order`, not `rows`: it is the list built alongside `payloads` in
+        # the loop above, so the two are index-aligned by construction.
+        await _insert_session_payments(db, ctx, order, payloads)
         await _accrue_imported_sessions(db, payloads)
 
     return {row.id: _Outcome(entity_id=payload["id"])
             for row, payload in zip(order, payloads)}
+
+
+async def _insert_session_payments(
+    db: AsyncSession, ctx: _Ctx, ordered_rows: list[ImportRow], payloads: list[dict]
+) -> None:
+    """One payment per imported session that carried money columns.
+
+    Runs after the sessions are inserted, so every payment has a session_id to
+    point at. Rows without an amount get no payment at all, which is what a
+    historical attendance register with no billing columns should produce.
+
+    `ordered_rows` is the list _insert_records builds alongside `payloads`, so
+    the two are index-aligned and can be zipped.
+    """
+    payments = []
+    for row, payload in zip(ordered_rows, payloads):
+        values = row.normalized_payload or {}
+        amount = values.get("payment_amount")
+        if amount in (None, ""):
+            continue
+        method = values.get("payment_method")
+        if not method:
+            # Guarded in the validator too; this is the backstop for a row that
+            # reached the writer anyway. Better a failed row than a payment
+            # that cannot say who is covering it.
+            raise ValueError(
+                "This session has a payment amount but no payment method."
+            )
+        payments.append({
+            "id": uuid7(),
+            "session_id": payload["id"],
+            "amount": Decimal(str(amount)),
+            "method": method,
+            "status": values.get("payment_status") or PaymentStatus.PENDING.value,
+            # Dated to the session, exactly as the scheduling endpoint does.
+            "date": payload["date"],
+            "created_by": ctx.created_by,
+        })
+
+    for group in _bind_chunks(payments, 7):
+        await db.execute(insert(Payment), group)
 
 
 async def _accrue_imported_sessions(db: AsyncSession, payloads: list[dict]) -> None:

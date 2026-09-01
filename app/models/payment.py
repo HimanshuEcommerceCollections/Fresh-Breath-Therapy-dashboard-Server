@@ -21,11 +21,23 @@ class Payment(Base):
 
     `amount` (was `amount_paid`) because a PENDING row records money expected,
     not money received - the old name contradicted the row it described.
+
+    ONE PAYMENT PER SESSION, and never without one. session_id is NOT NULL and
+    UNIQUE, and the pair is created in a single transaction by the scheduling
+    endpoint. Two consequences worth knowing:
+
+      - There is no client_id here. The person is whoever the session is for,
+        which may be a lead. That also means converting a lead moves their
+        payments for free: repointing the SESSION carries the payment with it.
+      - ondelete="CASCADE": deleting a session takes its payment with it,
+        because money recorded for an appointment that no longer exists is
+        orphaned. The unique constraint is what makes that safe to reason
+        about - there is only ever one row to remove.
     """
 
     __tablename__ = "payments"
     __table_args__ = (
-        Index("ix_payments_client_date", "client_id", "date"),
+        Index("ix_payments_date", "date"),
         Index("ix_payments_status", "status"),
     )
 
@@ -35,8 +47,11 @@ class Payment(Base):
     # See models/import_batch.py - proves a transaction has already been
     # imported and must not be added a second time on a re-sync.
     external_ref: Mapped[str | None] = mapped_column(String, nullable=True, unique=True)
-    client_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("clients.id"), nullable=False
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
     )
     amount: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
     method: Mapped[PaymentMethod] = mapped_column(
@@ -67,4 +82,4 @@ class Payment(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
-    client: Mapped["Client"] = relationship()
+    session: Mapped["Session"] = relationship(back_populates="payment")

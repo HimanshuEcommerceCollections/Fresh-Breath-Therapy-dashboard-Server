@@ -80,6 +80,7 @@ IDENTIFYING_FIELDS: dict[str, frozenset[str]] = {
     }),
     # date/time/type/status stay visible: rescheduling is the audit trail.
     "session": frozenset({"external_ref"}),
+    # No name or free text of its own — the person is on the session.
     "payment": frozenset({"external_ref"}),
     # Free text written about a named client.
     "follow_up": frozenset({"notes"}),
