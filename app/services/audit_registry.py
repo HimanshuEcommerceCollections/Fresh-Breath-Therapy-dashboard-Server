@@ -74,10 +74,13 @@ AUDITED_MODELS: dict[type, str] = {
 # Columns whose VALUES must never be written here. Recorded as
 # {"redacted": true} so the change is still visible and provable.
 IDENTIFYING_FIELDS: dict[str, frozenset[str]] = {
-    "client": frozenset({"name", "email", "phone", "external_ref"}),
+    "client": frozenset({"name", "email", "phone", "external_ref", "note"}),
     "lead": frozenset({
         "name", "email", "phone", "age", "gender_or_pronoun", "message",
         "preferred_datetime", "external_id", "customer_id",
+        # Free text an admin wrote about a named person's care. Same reasoning
+        # as follow_up.notes below.
+        "note",
     }),
     # date/time/type/status stay visible: rescheduling is the audit trail.
     "session": frozenset({"external_ref"}),

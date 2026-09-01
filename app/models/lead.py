@@ -52,6 +52,11 @@ class Lead(Base):
     customer_id: Mapped[str | None] = mapped_column(String, nullable=True)
     payment_status: Mapped[str | None] = mapped_column(String, nullable=True)
     visit_status: Mapped[str | None] = mapped_column(String, nullable=True)
+    # The admin's own short note about this person — "prefers mornings",
+    # "insurance pending". Distinct from `message`, which is what the CLIENT
+    # wrote on the website form and is never edited. Copied onto the client
+    # on conversion, so clients carry the identical column.
+    note: Mapped[str | None] = mapped_column(String(100), nullable=True)
     converted_client_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("clients.id"), nullable=True
     )

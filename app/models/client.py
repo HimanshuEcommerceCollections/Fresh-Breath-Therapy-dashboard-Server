@@ -28,6 +28,9 @@ class Client(Base):
     # existed have none on file, and a historical spreadsheet row may not
     # carry one either. Required-ness is a data-entry rule, not a schema one.
     phone: Mapped[str | None] = mapped_column(String, nullable=True)
+    # The admin's short note about this person. Same column as Lead.note and
+    # copied across verbatim on conversion — see leads.convert_lead.
+    note: Mapped[str | None] = mapped_column(String(100), nullable=True)
     therapist_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("therapists.id"), nullable=False
     )

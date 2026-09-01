@@ -7,7 +7,7 @@ from app.schemas.location import LocationResponse
 from app.schemas.therapist import TherapistResponse
 from app.models.enums import ClientStatus
 from app.schemas.fields import (
-    MAX_PHONE_LENGTH, MIN_PHONE_LENGTH, PersonName, Email, validate_phone,
+    MAX_PHONE_LENGTH, MIN_PHONE_LENGTH, PersonName, Email, Note, validate_phone,
 )
 
 
@@ -22,6 +22,9 @@ class ClientCreate(BaseModel):
     )
     therapist_id: uuid.UUID
     location_id: uuid.UUID
+    # Copied from the lead on conversion; editable afterwards like any other
+    # detail. Same 100-character rule as Lead.note.
+    note: Note | None = None
     status: ClientStatus = ClientStatus.CONSULTATION_COMPLETED
 
     _validate_phone = field_validator("phone")(validate_phone)
@@ -35,6 +38,7 @@ class ClientUpdate(BaseModel):
     )
     therapist_id: uuid.UUID | None = None
     location_id: uuid.UUID | None = None
+    note: Note | None = None
     status: ClientStatus | None = None
 
     _validate_phone = field_validator("phone")(validate_phone)
@@ -45,6 +49,7 @@ class ClientResponse(ORMBase):
     name: str
     email: str
     phone: str | None = None
+    note: str | None = None
     status: ClientStatus
     created_at: datetime
     location: LocationResponse

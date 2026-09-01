@@ -32,6 +32,7 @@ from app.models.session import Session
 from app.models.therapist import Therapist
 from app.schemas.fields import MAX_EMAIL_LENGTH, MAX_NAME_LENGTH
 from app.schemas.follow_up import MAX_NOTES_LENGTH
+from app.schemas.fields import MAX_NOTE_LENGTH
 
 
 class FieldKind(str, enum.Enum):
@@ -230,6 +231,9 @@ CLIENTS = EntitySpec(
         FieldSpec("location", "Location", FieldKind.FK, required=True,
                   fk_entity="locations", fk_auto_create=True,
                   aliases=("clinic", "site", "office", "city", "branch")),
+        FieldSpec("note", "Note", FieldKind.TEXT, max_length=MAX_NOTE_LENGTH,
+                  aliases=("notes", "comment", "comments", "remark", "remarks",
+                           "admin note", "internal note")),
         FieldSpec("status", "Status", FieldKind.ENUM,
                   writable=Writability.INSERT_ONLY, enum_cls=ClientStatus,
                   aliases=("client status", "stage", "progress", "phase")),
@@ -280,6 +284,13 @@ LEADS = EntitySpec(
                   aliases=("consent", "agreed", "hipaa consent", "terms")),
         FieldSpec("external_id", "Reference", FieldKind.TEXT, max_length=200,
                   aliases=("id", "ref", "submission id", "entry id", "record id")),
+        # Deliberately does NOT claim "notes"/"comment"/"comments": the
+        # `message` field above already owns those, because on a leads sheet
+        # that column is the enquiry the person wrote, not staff commentary.
+        FieldSpec("note", "Admin note", FieldKind.TEXT,
+                  max_length=MAX_NOTE_LENGTH,
+                  aliases=("admin note", "internal note", "staff note",
+                           "remark", "remarks")),
         FieldSpec("status", "Status", FieldKind.ENUM,
                   writable=Writability.INSERT_ONLY, enum_cls=LeadStatus,
                   aliases=("lead status", "stage", "pipeline", "progress")),

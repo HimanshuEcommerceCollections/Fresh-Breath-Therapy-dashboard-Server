@@ -7,7 +7,9 @@ from app.schemas.therapist import TherapistResponse
 from app.models.enums import LeadStatus
 # The phone rule moved to fields.py when clients gained a phone column too —
 # one definition, so the two entry points can't drift apart.
-from app.schemas.fields import PersonName, Email, validate_phone as _validate_phone
+from app.schemas.fields import (
+    PersonName, Email, Note, validate_phone as _validate_phone,
+)
 
 
 class LeadCreate(BaseModel):
@@ -19,6 +21,9 @@ class LeadCreate(BaseModel):
     location_id: uuid.UUID
     therapist_id: uuid.UUID | None = None
     source: str | None = None
+    # The admin's own note, not the website form's `message` — that one is
+    # written by the client and is never accepted from this endpoint.
+    note: Note | None = None
     status: LeadStatus = LeadStatus.NEW_LEAD
 
     _validate_phone = field_validator("phone")(_validate_phone)
@@ -33,6 +38,7 @@ class LeadUpdate(BaseModel):
     location_id: uuid.UUID | None = None
     therapist_id: uuid.UUID | None = None
     source: str | None = None
+    note: Note | None = None
     status: LeadStatus | None = None
 
     _validate_phone = field_validator("phone")(_validate_phone)
@@ -46,6 +52,7 @@ class LeadResponse(ORMBase):
     email: str
     phone: str
     source: str | None
+    note: str | None = None
     # Captured by the public website form and delivered via the lead webhook.
     message: str | None = None
     preferred_datetime: str | None = None

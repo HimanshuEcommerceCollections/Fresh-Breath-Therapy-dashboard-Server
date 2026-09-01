@@ -18,6 +18,10 @@ MAX_NAME_LENGTH = 50
 MAX_EMAIL_LENGTH = 50
 MIN_PHONE_LENGTH = 7
 MAX_PHONE_LENGTH = 20
+# The admin's free-text note on a lead or client. Short on purpose: it is
+# surfaced by hovering a name in a table, and a hover card is unreadable past
+# a line or two. Anything longer belongs in a follow-up, which is dated.
+MAX_NOTE_LENGTH = 100
 
 # strip_whitespace so " Jane " can't sneak past the limit or get stored padded.
 ShortName = Annotated[
@@ -53,4 +57,10 @@ def validate_phone(v: str | None) -> str | None:
 
 Phone = Annotated[
     str, Field(min_length=MIN_PHONE_LENGTH, max_length=MAX_PHONE_LENGTH)
+]
+
+# Leads and clients share this: a lead's note is copied to the client on
+# conversion, so the two must agree on what fits.
+Note = Annotated[
+    str, StringConstraints(max_length=MAX_NOTE_LENGTH, strip_whitespace=True)
 ]

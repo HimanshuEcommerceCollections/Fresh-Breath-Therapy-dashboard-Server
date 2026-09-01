@@ -187,6 +187,9 @@ async def convert_lead(
         # is collected, and before clients had this column, converting a lead
         # silently discarded the only number anyone had for them.
         phone=lead.phone,
+        # The admin's note follows the person, not the record type — it is the
+        # same standing fact about them either side of the conversion.
+        note=lead.note,
         therapist_id=lead.therapist_id,
         location_id=lead.location_id,
     )
