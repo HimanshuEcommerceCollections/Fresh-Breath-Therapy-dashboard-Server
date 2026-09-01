@@ -29,7 +29,6 @@ TWO SEPARATE DECISIONS LIVE HERE.
 """
 from app.models.client import Client
 from app.models.client_message import ClientMessage
-from app.models.enrollment import Enrollment
 from app.models.feature_flag import FeatureFlag
 from app.models.follow_up import FollowUp
 from app.models.import_batch import ImportBatch
@@ -37,7 +36,6 @@ from app.models.lead import Lead
 from app.models.location import Location
 from app.models.notification import Notification
 from app.models.organization_settings import OrganizationSettings
-from app.models.package import Package
 from app.models.payment import Payment
 from app.models.pto_transaction import PtoTransaction
 from app.models.role import Role
@@ -52,7 +50,6 @@ AUDITED_MODELS: dict[type, str] = {
     Lead: "lead",
     SessionModel: "session",
     Payment: "payment",
-    Enrollment: "enrollment",
     FollowUp: "follow_up",
     ClientMessage: "client_message",
     Therapist: "therapist",
@@ -66,7 +63,6 @@ AUDITED_MODELS: dict[type, str] = {
     Role: "role",
     RoleRequest: "role_request",
     Location: "location",
-    Package: "package",
     FeatureFlag: "feature_flag",
     OrganizationSettings: "organization_settings",
 }
@@ -85,7 +81,6 @@ IDENTIFYING_FIELDS: dict[str, frozenset[str]] = {
     # date/time/type/status stay visible: rescheduling is the audit trail.
     "session": frozenset({"external_ref"}),
     "payment": frozenset({"external_ref"}),
-    "enrollment": frozenset({"external_ref"}),
     # Free text written about a named client.
     "follow_up": frozenset({"notes"}),
     "client_message": frozenset({"body"}),
@@ -102,7 +97,6 @@ IDENTIFYING_FIELDS: dict[str, frozenset[str]] = {
     "role_request": frozenset(),
     "role": frozenset(),
     "location": frozenset(),
-    "package": frozenset(),
     "feature_flag": frozenset(),
     "organization_settings": frozenset(),
 }

@@ -32,8 +32,6 @@ from decimal import Decimal
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.enrollment import Enrollment
-from app.models.enums import EnrollmentStatus
 from app.models.import_batch import ImportRowStatus
 from app.services.importer import normalizers
 from app.services.importer.registry import (
@@ -316,7 +314,7 @@ async def load_existing_index(
     # sheet, and the name->id swap does not happen until the per-row loop
     # below. Resolving it here by calling uuid.UUID() on a name is exactly the
     # bug the full-output differential caught — it crashed every entity whose
-    # natural key contains a foreign key (enrollments, payments, sessions)
+    # natural key contains a foreign key (payments, sessions)
     # while leaving the text-keyed entities working, so nothing noticed.
     #
     # The natural key is a COMPOSITE, and reconstructing it in SQL differs per
@@ -382,42 +380,6 @@ async def load_existing_index(
 
     return by_ref, by_key
 
-
-# ── enrollment cycles ─────────────────────────────────────────────────────
-
-def _cycle_key(values: dict) -> str:
-    """(client, package) — the pair the database allows one ACTIVE row for."""
-    return f"{values.get('client')}|{values.get('package')}"
-
-
-async def load_active_cycles(db: AsyncSession) -> dict[str, str]:
-    """(client, package) pairs that already have an unfinished enrollment.
-
-    An enrollment completes when its payments cover the price — until then a
-    second one for the same client and package can't be started. Postgres
-    already enforces this with a partial unique index, but hitting it at
-    INSERT means a raw constraint violation halfway through a commit. Catching
-    it here turns it into a sentence on the review screen, before anything is
-    written, naming exactly what's outstanding.
-
-    Note this is keyed on client + package only, not therapist: an enrollment
-    records who bought what, not who delivers it, so changing therapist does
-    not start a new purchase cycle.
-    """
-    result = await db.execute(
-        select(Enrollment).where(Enrollment.status == EnrollmentStatus.ACTIVE)
-    )
-    cycles: dict[str, str] = {}
-    for row in result.scalars().all():
-        paid = Decimal(str(row.total_paid or 0))
-        price = Decimal(str(row.package_price_snapshot or 0))
-        outstanding = price - paid
-        cycles[f"{row.client_id}|{row.package_id}"] = (
-            "This client already has an active enrollment for this package "
-            f"(${paid:,.2f} of ${price:,.2f} paid, ${outstanding:,.2f} "
-            "outstanding). Finish paying it off before starting another."
-        )
-    return cycles
 
 
 # ── diffing an update ─────────────────────────────────────────────────────
@@ -498,11 +460,6 @@ async def validate_rows(
         db, entity, _index_bounds(entity, rows, prepared, fk)
     )
     ref_field = "external_id" if entity.key == "leads" else "external_ref"
-    # Only enrollments have a one-active-cycle rule; None everywhere else
-    # keeps the check out of the hot loop entirely.
-    active_cycles = (
-        await load_active_cycles(db) if entity.key == "enrollments" else None
-    )
 
     verdicts: list[RowVerdict] = []
     # Rows within one file can collide with each other, not just with the
@@ -623,23 +580,6 @@ async def validate_rows(
             seen_keys.setdefault(key, row_number)
 
         if existing is None:
-            # A cycle that cannot start until the previous one is settled.
-            conflict = active_cycles.get(_cycle_key(normalized)) if active_cycles else None
-            if conflict is not None:
-                verdicts.append(RowVerdict(
-                    row_number=row_number, status=ImportRowStatus.ERROR.value,
-                    normalized=jsonable, source_hash=source_hash,
-                    errors=[{"field": None, "column": None, "message": conflict}],
-                ))
-                continue
-            if active_cycles is not None:
-                # Claim the pair so a SECOND row in this same sheet for the
-                # same client and package is caught too, not just a clash with
-                # what's already in the database.
-                active_cycles[_cycle_key(normalized)] = (
-                    f"Row {row_number} of this file already starts an enrollment "
-                    "for this client and package. Only one can be active at a time."
-                )
             verdicts.append(RowVerdict(
                 row_number=row_number, status=ImportRowStatus.CREATE.value,
                 normalized=jsonable, source_hash=source_hash,
@@ -647,10 +587,10 @@ async def validate_rows(
             continue
 
         if not entity.supports_update:
-            # Payments: the ledger is append-only. An identical transaction
-            # already on file is the same payment entered twice — the natural
-            # key covers client, package, date, amount AND method, so a real
-            # second payment differs somewhere and lands as a CREATE above.
+            # Payments are append-only. An identical transaction already on
+            # file is the same payment entered twice — the natural key covers
+            # client, date, amount AND method, so a real second payment differs
+            # somewhere and lands as a CREATE above.
             verdicts.append(RowVerdict(
                 row_number=row_number, status=ImportRowStatus.DUPLICATE.value,
                 normalized=jsonable, source_hash=source_hash,
@@ -659,7 +599,7 @@ async def validate_rows(
                     "field": None, "column": None,
                     "message": (
                         "This exact payment is already recorded — same client, "
-                        "package, date, amount and method."
+                        "date, amount and method."
                     ),
                 }],
             ))

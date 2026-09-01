@@ -11,7 +11,7 @@ from app.models.location import Location
 from app.models.therapist import Therapist
 from app.models.payment import Payment
 from app.models.session import Session as SessionModel
-from app.models.enums import ContactStatus
+from app.models.enums import ContactStatus, COLLECTED_STATUSES
 from app.schemas.client import ClientCreate, ClientUpdate, ClientResponse
 from app.models.user import User
 from app.dependencies.auth import get_current_user, require_admin, get_own_therapist
@@ -36,8 +36,9 @@ async def _attach_computed_fields(db: AsyncSession, clients: list[Client]) -> li
     client_ids = [c.id for c in clients]
 
     payment_rows = await db.execute(
-        select(Payment.client_id, func.coalesce(func.sum(Payment.amount_paid), 0))
-        .where(Payment.client_id.in_(client_ids))
+        select(Payment.client_id, func.coalesce(func.sum(Payment.amount), 0))
+        .where(Payment.client_id.in_(client_ids),
+               Payment.status.in_(COLLECTED_STATUSES))
         .group_by(Payment.client_id)
     )
     lifetime_values = {row[0]: row[1] for row in payment_rows.all()}

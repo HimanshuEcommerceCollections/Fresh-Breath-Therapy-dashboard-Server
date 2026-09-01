@@ -76,32 +76,42 @@ class SessionStatus(str, enum.Enum):
 
 
 class PaymentMethod(str, enum.Enum):
-    CREDIT_CARD = "credit_card"
-    ACH = "ach"
-    CASH = "cash"
+    """How the money for a session is being covered.
+
+    Replaces the old card/ACH/cash/insurance list, which described the
+    INSTRUMENT. What the practice actually needs to know is who is paying:
+    a copay alongside insurance, the client covering it themselves, or the
+    insurer. The instrument was never used for anything.
+    """
+    COPAY = "copay"
+    SELF_PAY = "self_pay"
     INSURANCE = "insurance"
 
 
-class EnrollmentStatus(str, enum.Enum):
-    """Lifecycle of a purchase cycle — distinct from PaymentStatus below,
-    which is what the Payments table displays."""
-    ACTIVE = "active"
-    COMPLETED = "completed"
-
-
 class PaymentStatus(str, enum.Enum):
-    """What the Payments table shows per invoice.
+    """Whether the money for a session has arrived.
 
-    PAID / PARTIALLY_PAID / PENDING are DERIVED from the money on the
-    enrollment and are never stored — deriving them keeps the status from
-    ever contradicting the ledger. OVERDUE is the one an admin sets by hand
-    (via enrollments.is_overdue), because only a human knows a payment is
-    late; clearing that flag drops the invoice back to its derived status.
+    STORED, not derived. It used to be computed from an enrollment's running
+    balance (paid / partially_paid / pending, with overdue as the one stored
+    override). With packages gone there is no balance to derive from: a session
+    costs what it costs, and the admin says whether it has been paid.
+
+    CANCELLED means the session did not happen and will not be billed. It is
+    counted as neither collected nor outstanding, so it drops out of revenue
+    entirely rather than sitting in the outstanding figure forever. Setting it
+    is always a human decision - cancelling or no-showing a SESSION does not
+    touch its payment, because a no-show is often still billed.
     """
     PAID = "paid"
-    PARTIALLY_PAID = "partially_paid"
     PENDING = "pending"
-    OVERDUE = "overdue"
+    CANCELLED = "cancelled"
+
+
+# Revenue that has actually arrived, versus revenue still expected. CANCELLED
+# is in neither on purpose. Defined here so the dashboard, the reports and the
+# payments page cannot each decide what "collected" means.
+COLLECTED_STATUSES = (PaymentStatus.PAID,)
+OUTSTANDING_STATUSES = (PaymentStatus.PENDING,)
 
 
 class PtoTransactionType(str, enum.Enum):

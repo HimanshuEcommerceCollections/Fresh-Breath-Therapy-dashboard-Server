@@ -234,5 +234,4 @@ class CommitResult(BaseModel):
 class RollbackResult(BaseModel):
     deleted: int
     reverted: int
-    enrollments_recomputed: int
     batch: ImportBatchSummary

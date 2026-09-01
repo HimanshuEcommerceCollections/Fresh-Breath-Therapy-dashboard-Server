@@ -1,7 +1,7 @@
 """CSV + PDF rendering for report and invoice exports.
 
 Deliberately dumb: it takes already-computed headers and rows and turns them
-into bytes. All the querying stays in the report/enrollment routers so there
+into bytes. All the querying stays in the report/export routers so there
 is exactly one source of truth for what a "sales report" means — an export
 can never drift from what the chart on screen shows.
 

@@ -18,15 +18,13 @@ import enum
 from dataclasses import dataclass, field as dc_field
 
 from app.models.client import Client
-from app.models.enrollment import Enrollment
 from app.models.follow_up import FollowUp
 from app.models.enums import (
-    ContactStatus, EnrollmentStatus, PaymentMethod,
+    ContactStatus, PaymentMethod, PaymentStatus,
     SessionStatus, SessionType,
 )
 from app.models.lead import Lead
 from app.models.location import Location
-from app.models.package import Package
 from app.models.payment import Payment
 from app.models.session import Session
 from app.models.therapist import Therapist
@@ -66,11 +64,10 @@ class Writability(str, enum.Enum):
                  that state is driven by people working in the dashboard.
                  `migration_mode` on the batch lifts this, deliberately and
                  visibly, while loading history into an empty database.
-    NEVER        derived. Money totals are computed from the payments ledger
-                 (see Enrollment.payment_status); accepting them from a sheet
-                 would let a record contradict its own transactions. Listed
-                 here anyway so the UI can *explain* the refusal rather than
-                 leaving the column mysteriously unmappable.
+    NEVER        derived. Accepting such a column from a sheet would let a
+                 record contradict its own data. Listed here anyway so the UI
+                 can *explain* the refusal rather than leaving the column
+                 mysteriously unmappable.
     """
     ALWAYS = "always"
     INSERT_ONLY = "insert_only"
@@ -185,27 +182,6 @@ THERAPISTS = EntitySpec(
     ),
 )
 
-PACKAGES = EntitySpec(
-    key="packages",
-    label="Packages",
-    model=Package,
-    natural_key=("name",),
-    fields=(
-        FieldSpec("name", "Package name", FieldKind.TEXT, required=True,
-                  max_length=MAX_NAME_LENGTH,
-                  aliases=("package", "program", "programme", "plan",
-                           "service", "therapy", "treatment")),
-        FieldSpec("price", "Price", FieldKind.MONEY, required=True,
-                  aliases=("cost", "amount", "fee", "package price", "rate")),
-        FieldSpec("is_active", "Active", FieldKind.BOOL,
-                  aliases=("active", "available", "offered")),
-    ),
-    notes=(
-        "Package name is not unique in the database, so a re-import matches on "
-        "the written-back reference rather than the name.",
-    ),
-)
-
 CLIENTS = EntitySpec(
     key="clients",
     label="Clients",
@@ -301,97 +277,41 @@ LEADS = EntitySpec(
     ),
 )
 
-ENROLLMENTS = EntitySpec(
-    key="enrollments",
-    label="Enrollments",
-    model=Enrollment,
-    depends_on=("clients", "packages"),
-    natural_key=("client", "package", "started_at"),
-    fields=(
-        FieldSpec("client", "Client", FieldKind.FK, required=True,
-                  fk_entity="clients",
-                  aliases=("client name", "patient", "patient name")),
-        FieldSpec("package", "Package", FieldKind.FK, required=True,
-                  fk_entity="packages",
-                  aliases=("program", "programme", "plan", "service", "therapy")),
-        FieldSpec("package_price_snapshot", "Price at purchase", FieldKind.MONEY,
-                  required=True, writable=Writability.INSERT_ONLY,
-                  aliases=("price", "package price", "agreed price",
-                           "total", "total cost", "amount"),
-                  help_text="The price THIS client agreed to, which may differ "
-                            "from the package's current list price."),
-        FieldSpec("started_at", "Start date", FieldKind.DATE,
-                  writable=Writability.INSERT_ONLY,
-                  aliases=("start", "started", "enrolled", "enrollment date",
-                           "date started", "begin date")),
-        FieldSpec("completed_at", "Completion date", FieldKind.DATE,
-                  writable=Writability.INSERT_ONLY,
-                  aliases=("completed", "finished", "end date", "date completed")),
-        FieldSpec("is_overdue", "Overdue", FieldKind.BOOL,
-                  writable=Writability.INSERT_ONLY,
-                  aliases=("overdue", "late", "past due"),
-                  help_text="The only payment status that is stored. Paid / "
-                            "Partially Paid / Pending are computed from the ledger."),
-        # Present so the mapping screen can say WHY these can't be imported,
-        # rather than the admin hunting for a "Total Paid" option that isn't there.
-        FieldSpec("total_paid", "Total paid", FieldKind.MONEY,
-                  writable=Writability.NEVER,
-                  help_text="Derived by summing this enrollment's payments."),
-        FieldSpec("amount_due", "Amount due", FieldKind.MONEY,
-                  writable=Writability.NEVER,
-                  help_text="Derived from price minus payments."),
-        FieldSpec("status", "Enrollment status", FieldKind.ENUM,
-                  writable=Writability.NEVER, enum_cls=EnrollmentStatus,
-                  help_text="Becomes Completed automatically once payments "
-                            "cover the price."),
-    ),
-    notes=(
-        "Import enrollments BEFORE payments so each one carries its historical "
-        "price. Letting a payment auto-create its enrollment would snapshot "
-        "today's list price onto a purchase made years ago.",
-    ),
-)
-
 PAYMENTS = EntitySpec(
     key="payments",
     label="Payments",
     model=Payment,
-    depends_on=("clients", "packages", "enrollments"),
+    depends_on=("clients",),
     # Every field that makes one transaction distinguishable from another.
-    # Two payments from the same client, for the same package, on the same
-    # day, for the same amount, by the same method are one payment entered
-    # twice — a real second payment differs in at least one of these.
-    natural_key=("client", "package", "date", "amount_paid", "method"),
+    # Two payments from the same client, on the same day, for the same amount,
+    # by the same method are one payment entered twice — a real second payment
+    # differs in at least one of these.
+    natural_key=("client", "date", "amount", "method"),
     supports_update=False,
     fields=(
         FieldSpec("client", "Client", FieldKind.FK, required=True,
                   fk_entity="clients",
                   aliases=("client name", "patient", "paid by")),
-        FieldSpec("package", "Package", FieldKind.FK, required=True,
-                  fk_entity="packages",
-                  aliases=("program", "programme", "plan", "service",
-                           "therapy", "paid for")),
-        FieldSpec("amount_paid", "Amount paid", FieldKind.MONEY, required=True,
-                  aliases=("amount", "payment", "paid", "installment",
-                           "instalment", "transaction amount", "sum")),
+        FieldSpec("amount", "Amount", FieldKind.MONEY, required=True,
+                  aliases=("amount paid", "payment", "paid", "fee", "charge",
+                           "transaction amount", "sum", "price")),
         FieldSpec("date", "Payment date", FieldKind.DATE, required=True,
                   aliases=("paid on", "transaction date", "date paid",
                            "payment date", "received")),
         FieldSpec("method", "Method", FieldKind.ENUM, required=True,
                   enum_cls=PaymentMethod,
-                  aliases=("payment method", "paid via", "type", "mode",
-                           "payment type", "via")),
-        FieldSpec("balance_after", "Balance after", FieldKind.MONEY,
-                  writable=Writability.NEVER,
-                  help_text="A point-in-time fact, recomputed as each payment "
-                            "is replayed in date order."),
+                  aliases=("payment method", "paid via", "mode",
+                           "payment type", "via", "coverage")),
+        # INSERT_ONLY, matching every other workflow status in this registry:
+        # the sheet says where a historical payment ended up, but an admin
+        # working in the dashboard owns it from then on.
+        FieldSpec("status", "Status", FieldKind.ENUM,
+                  writable=Writability.INSERT_ONLY, enum_cls=PaymentStatus,
+                  aliases=("payment status", "paid?", "settled", "state")),
     ),
     notes=(
-        "Append-only. A transaction that already exists is skipped, never "
-        "edited — rewriting one would invalidate the running balance on every "
-        "payment that followed it.",
-        "Rows are committed in date order per enrollment so the running total "
-        "and balance match what the dashboard would have recorded live.",
+        "Append-only. A transaction that already exists is skipped rather "
+        "than edited.",
     ),
 )
 
@@ -472,19 +392,31 @@ FOLLOW_UPS = EntitySpec(
 # Ordered: the picker renders it top to bottom, and it is a valid topological
 # order, so following it never hits an unresolvable foreign key.
 #
-# Append-only. _entity_lock_key indexes into this tuple to derive each entity's
-# advisory-lock id, so inserting in the middle would renumber the others and a
-# deploy mid-import could have two runs holding different keys for the same
-# table.
 ENTITY_ORDER: tuple[str, ...] = (
+    "locations", "therapists", "clients",
+    "leads", "payments", "sessions", "follow_ups",
+)
+
+# Advisory-lock slots. STRICTLY APPEND-ONLY, and deliberately separate from
+# ENTITY_ORDER above.
+#
+# _entity_lock_key indexes into this tuple to derive an entity's lock id, so
+# renumbering it during a deploy could leave two running imports holding
+# different locks for the same table. ENTITY_ORDER, by contrast, has to shrink
+# when an entity is retired, because callers do REGISTRY[key] over it.
+#
+# So retired entities keep their slots forever. "packages" and "enrollments"
+# are gone from the product; their positions stay here so that clients, leads,
+# payments and the rest keep the lock ids they already had.
+_LOCK_SLOTS: tuple[str, ...] = (
     "locations", "therapists", "packages", "clients",
     "leads", "enrollments", "payments", "sessions", "follow_ups",
 )
 
 REGISTRY: dict[str, EntitySpec] = {
     spec.key: spec
-    for spec in (LOCATIONS, THERAPISTS, PACKAGES, CLIENTS,
-                 LEADS, ENROLLMENTS, PAYMENTS, SESSIONS, FOLLOW_UPS)
+    for spec in (LOCATIONS, THERAPISTS, CLIENTS,
+                 LEADS, PAYMENTS, SESSIONS, FOLLOW_UPS)
 }
 
 

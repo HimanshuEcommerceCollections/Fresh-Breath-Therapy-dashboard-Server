@@ -1,7 +1,7 @@
 """Turning the names in a spreadsheet into foreign keys.
 
 Diane's sheets refer to people and things the only way a human can — by name.
-"Sarah Chen", "Anxiety Package", "Cary". The database refers to them by UUID.
+"Sarah Chen", "Cary". The database refers to them by UUID.
 
 The hard case is a name that matches more than one record, and the naive fix
 — one decision per distinct name — is quietly wrong. If five clients name
@@ -40,7 +40,6 @@ from sqlalchemy.orm import selectinload
 
 from app.models.client import Client
 from app.models.location import Location
-from app.models.package import Package
 from app.models.therapist import Therapist
 from app.services.importer.registry import FieldKind, FieldSpec, get_entity
 
@@ -51,14 +50,12 @@ LOOKUP_COLUMNS = {
     "locations": (Location.name,),
     "therapists": (Therapist.name, Therapist.email),
     "clients": (Client.name, Client.email),
-    "packages": (Package.name,),
 }
 
 MODELS = {
     "locations": Location,
     "therapists": Therapist,
     "clients": Client,
-    "packages": Package,
 }
 
 # How to read the disambiguating attribute off an existing record, so it can
@@ -156,15 +153,13 @@ def _label(target: str, row) -> str:
         ]
     elif target == "leads":
         parts = [row.name, row.email, getattr(row.location, "name", None)]
-    elif target == "packages":
-        parts = [row.name, f"${row.price}"]
     else:
         parts = [row.name]
     return " · ".join(str(p) for p in parts if p)
 
 
 def _row_label(values: dict) -> str:
-    for key in ("name", "email", "client", "package"):
+    for key in ("name", "email", "client"):
         value = values.get(key)
         if value:
             return str(value)

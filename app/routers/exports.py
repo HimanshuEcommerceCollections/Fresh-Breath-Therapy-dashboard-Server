@@ -15,13 +15,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database import get_db
-from app.models.enrollment import Enrollment
-from app.models.enums import PaymentStatus, CONTACT_STATUS_LABELS
+from app.models.enums import (
+    PaymentMethod, PaymentStatus, CONTACT_STATUS_LABELS,
+    COLLECTED_STATUSES, OUTSTANDING_STATUSES,
+)
+from app.models.payment import Payment
 from app.models.user import User
 from app.dependencies.auth import require_admin_or_coordinator
 from app.services.audit_service import record_export
 from app.routers import reports as reports_router
-from app.routers.enrollments import _enrollment_query, _payment_status_filter
+from app.routers.payments import _payment_query
 from app.services.export_service import (
     MEDIA_TYPES, filename_for, to_csv, to_pdf,
 )
@@ -37,10 +40,20 @@ RANGE_LABELS = {
 
 STATUS_LABELS = {
     PaymentStatus.PAID: "Paid",
-    PaymentStatus.PARTIALLY_PAID: "Partially Paid",
     PaymentStatus.PENDING: "Pending",
-    PaymentStatus.OVERDUE: "Overdue",
+    PaymentStatus.CANCELLED: "Cancelled",
 }
+
+METHOD_LABELS = {
+    PaymentMethod.COPAY: "Copay",
+    PaymentMethod.SELF_PAY: "Self-Pay",
+    PaymentMethod.INSURANCE: "Insurance",
+}
+
+# Same guard as the status labels in models/enums.py: a new method or status
+# must not silently render as its raw enum value in an export.
+assert set(STATUS_LABELS) == set(PaymentStatus)
+assert set(METHOD_LABELS) == set(PaymentMethod)
 
 # Keyed by the raw enum VALUE, since that is what the export rows carry.
 # Derived from the single label map in models/enums.py rather than restated —
@@ -151,54 +164,63 @@ async def export_report(
 async def export_payments(
     format: str = Query("csv", pattern="^(csv|pdf)$"),
     payment_status: PaymentStatus | None = None,
+    method: PaymentMethod | None = None,
     client_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_admin_or_coordinator()),
 ):
     """The Payments table as it stands, all rows — an export that stopped at
-    the first scrolled-in page would quietly under-report."""
-    query = _enrollment_query()
+    the first scrolled-in page would quietly under-report.
+
+    One row per payment now, not per invoice: with packages gone there is no
+    Due/Paid/Balance triple to report, only what a session cost and whether it
+    has been settled.
+    """
+    query = _payment_query()
     if payment_status:
-        query = _payment_status_filter(query, payment_status)
+        query = query.where(Payment.status == payment_status)
+    if method:
+        query = query.where(Payment.method == method)
     if client_id:
-        query = query.where(Enrollment.client_id == client_id)
+        query = query.where(Payment.client_id == client_id)
 
-    result = await db.execute(query.order_by(Enrollment.created_at.desc()))
-    invoices = result.scalars().all()
+    result = await db.execute(query.order_by(Payment.date.desc()))
+    payments = result.scalars().all()
 
-    headers = ["Client", "Package", "Due (USD)", "Paid (USD)", "Balance (USD)",
-               "Status", "Started"]
+    headers = ["Client", "Amount (USD)", "Method", "Status", "Date"]
     rows = [[
-        e.client.name if e.client else "",
-        e.package.name if e.package else "",
-        _num(e.package_price_snapshot),
-        _num(e.total_paid),
-        _num(e.amount_due),
-        STATUS_LABELS.get(e.payment_status, e.payment_status.value),
-        e.started_at.date().isoformat() if e.started_at else "",
-    ] for e in invoices]
+        p.client.name if p.client else "",
+        _num(p.amount),
+        METHOD_LABELS.get(p.method, p.method.value),
+        STATUS_LABELS.get(p.status, p.status.value),
+        p.date.isoformat() if p.date else "",
+    ] for p in payments]
 
     if format == "csv":
         body = to_csv(headers, rows)
     else:
-        sub = STATUS_LABELS.get(payment_status, "All invoices") if payment_status else "All invoices"
-        total_due = sum(float(e.amount_due) for e in invoices)
-        total_paid = sum(float(e.total_paid) for e in invoices)
+        sub = STATUS_LABELS.get(payment_status, "All payments") if payment_status else "All payments"
+        # Totalled by what each row IS, not by the filter — a filtered export
+        # still reports its own collected/outstanding split correctly, and a
+        # cancelled row lands in neither.
+        collected = sum(float(p.amount) for p in payments if p.status in COLLECTED_STATUSES)
+        outstanding = sum(float(p.amount) for p in payments if p.status in OUTSTANDING_STATUSES)
         body = to_pdf(
             "Payments",
-            f"{sub} · {len(invoices)} invoice(s) · collected {total_paid:,.2f} · "
-            f"outstanding {total_due:,.2f}",
+            f"{sub} · {len(payments)} payment(s) · collected {collected:,.2f} · "
+            f"outstanding {outstanding:,.2f}",
             headers, _fmt_for_pdf(rows),
         )
 
     # Deliberately unbounded (see the docstring), so this is the single
     # largest PHI extraction the API offers and the ids are worth keeping.
     await record_export(
-        db, "enrollment",
-        count=len(invoices),
-        entity_ids=[e.id for e in invoices],
+        db, "payment",
+        count=len(payments),
+        entity_ids=[p.id for p in payments],
         criteria={"format": format,
                   "payment_status": payment_status.value if payment_status else None,
+                  "method": method.value if method else None,
                   "client_id": str(client_id) if client_id else None},
     )
     fname = filename_for("fbt-payments", format)

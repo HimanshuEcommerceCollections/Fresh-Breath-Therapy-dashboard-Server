@@ -16,7 +16,6 @@ Three rules this module exists to enforce:
     arithmetic as routers/payments.py — so total_paid, amount_due and each
     payment's balance_after come out identical to what the dashboard would
     have recorded had the payments been entered live, one at a time.
-  * Enrollments carry the price from the sheet, never today's list price.
   * No notifications. The lead webhook raises one per lead, which is right
     for a trickle of live enquiries and catastrophic for a 500-row import.
 """
@@ -31,19 +30,17 @@ from decimal import Decimal
 
 from sqlalchemy import (
     Boolean, Date, DateTime, Integer, Numeric, Time, bindparam, delete, func,
-    select, text, tuple_, update,
+    select, text, update,
 )
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models.enrollment import Enrollment
-from app.models.enums import EnrollmentStatus, PtoTransactionType, SessionStatus
+from app.models.enums import PtoTransactionType, SessionStatus
 from app.models.pto_transaction import PtoTransaction
 from app.services.pto_service import ACCRUAL_RATE
 from app.models.import_batch import ImportBatch, ImportRow, ImportRowStatus, ImportStatus
 from app.models.location import Location
-from app.models.package import Package
 from app.models.payment import Payment
 from app.services.ids import uuid7
 from app.services.importer.registry import FieldKind, Writability, get_entity
@@ -53,7 +50,7 @@ from app.services.importer.validator import model_attr
 logger = logging.getLogger(__name__)
 
 # Rows per call. Small enough to stay well inside a serverless timeout even
-# when every row triggers an enrollment lock, large enough that a few thousand
+# large enough that a few thousand
 # rows is a handful of calls rather than hundreds.
 CHUNK_SIZE = 200
 
@@ -71,15 +68,15 @@ _ADVISORY_LOCK_KEY = 0x1_50_1_1_0_0_7  # "IMPORT" in a shape that fits an int32
 def _entity_lock_key(entity: str) -> int:
     """Stable per-entity classid for pg_try_advisory_xact_lock(int, int).
 
-    Index into ENTITY_ORDER rather than a hash, so the value is small,
+    Index into _LOCK_SLOTS rather than a hash, so the value is small,
     readable in pg_locks, and cannot collide.
     """
-    from app.services.importer.registry import ENTITY_ORDER
+    from app.services.importer.registry import _LOCK_SLOTS
 
     try:
-        return ENTITY_ORDER.index(entity)
+        return _LOCK_SLOTS.index(entity)
     except ValueError:
-        return len(ENTITY_ORDER)
+        return len(_LOCK_SLOTS)
 
 
 def _tier_sizes() -> list[int]:
@@ -157,19 +154,15 @@ async def find_running_import(
     tables genuinely do not contend: a therapists import and a sessions import
     touch different rows, and making one wait for the other bought nothing.
 
-    Same-entity is where it matters, and payments are the clearest case: two
-    payments imports against one enrollment would each compute their
-    balance_after chain from the same starting total, and the second would
-    silently overwrite the first's arithmetic.
+    Same-entity is where it matters: two imports into one table can both
+    resolve the same natural key and each believe it is creating the row.
 
     Residual risk, accepted and worth naming: entities are not perfectly
-    independent. A payments import can auto-create an enrollment, and a
-    clients import can create the client a concurrent sessions import is
-    trying to resolve. Neither corrupts data — the partial unique index
-    rejects a duplicate active enrollment as a normal row failure, and an
-    unresolvable name was already NEEDS_INPUT before either started. What can
-    happen is a verdict going stale mid-run, which surfaces as a failed or
-    parked row rather than a wrong one.
+    independent. A clients import can create the client a concurrent sessions
+    import is trying to resolve. That does not corrupt data — an unresolvable
+    name was already NEEDS_INPUT before either started. What can happen is a
+    verdict going stale mid-run, which surfaces as a failed or parked row
+    rather than a wrong one.
     """
     query = select(ImportBatch).where(
         ImportBatch.entity == entity,
@@ -231,13 +224,10 @@ def _pending_query(batch: ImportBatch):
     query = select(ImportRow).where(
         ImportRow.batch_id == batch.id, ImportRow.status.in_(PENDING)
     )
-    if batch.entity == "payments":
-        # Date order, because each payment's balance_after depends on every
-        # payment before it. Sheet order would produce a running balance that
-        # is arithmetically correct but historically wrong.
-        return query.order_by(
-            text("normalized_payload->>'date'"), ImportRow.row_number
-        )
+    # Sheet order, for every entity. Payments used to be forced into date
+    # order because each row's balance_after depended on the ones before it.
+    # A payment no longer carries a running balance, so the order in which two
+    # payments are inserted has no effect on what either of them says.
     return query.order_by(ImportRow.row_number)
 
 
@@ -340,11 +330,6 @@ def humanize(exc: Exception) -> str:
     # top and a local of that name shadows it inside this function.
     detail = str(exc)
 
-    if "uq_active_enrollment" in detail:
-        return (
-            "This client already has an active enrollment for this package. "
-            "Complete the existing one first, or remove this row from the sheet."
-        )
     if "duplicate key" in detail or "UniqueViolationError" in detail:
         match = re.search(r"Key \((?P<cols>[^)]+)\)=", detail)
         if match:
@@ -365,106 +350,6 @@ def humanize(exc: Exception) -> str:
         return "A value is too long for its field."
 
     return detail.strip().splitlines()[0][:300]
-
-
-async def _create_payment(
-    db: AsyncSession, values: dict, ref: str, created_by: uuid.UUID | None
-) -> Payment:
-    """One imported transaction, applied exactly as create_payment would.
-
-    Locks the enrollment row for the update so a concurrent live payment
-    can't read the same total and drop one of the two.
-    """
-    client_id = uuid.UUID(values["client"])
-    package_id = uuid.UUID(values["package"])
-    amount = Decimal(str(values["amount_paid"]))
-
-    result = await db.execute(
-        select(Enrollment)
-        .where(
-            Enrollment.client_id == client_id,
-            Enrollment.package_id == package_id,
-            Enrollment.status == EnrollmentStatus.ACTIVE,
-        )
-        .with_for_update()
-    )
-    enrollment = result.scalar_one_or_none()
-
-    if enrollment is None:
-        # No active cycle. Falls back to the package's current price, which is
-        # why enrollments are meant to be imported first — a purchase made in
-        # 2021 should carry its 2021 price, and only the enrollments sheet
-        # knows what that was.
-        package = await db.get(Package, package_id)
-        if package is None:
-            raise ValueError("Package no longer exists")
-        enrollment = Enrollment(
-            id=uuid.uuid4(),
-            client_id=client_id,
-            package_id=package_id,
-            package_price_snapshot=package.price,
-            total_paid=Decimal("0"),
-            amount_due=package.price,
-            status=EnrollmentStatus.ACTIVE,
-        )
-        db.add(enrollment)
-        await db.flush()
-
-    enrollment.total_paid = Decimal(str(enrollment.total_paid)) + amount
-    remaining = Decimal(str(enrollment.package_price_snapshot)) - Decimal(
-        str(enrollment.total_paid)
-    )
-    enrollment.amount_due = remaining if remaining > 0 else Decimal("0")
-
-    if Decimal(str(enrollment.total_paid)) >= Decimal(
-        str(enrollment.package_price_snapshot)
-    ):
-        enrollment.status = EnrollmentStatus.COMPLETED
-        enrollment.completed_at = datetime.now(timezone.utc)
-        enrollment.is_overdue = False
-
-    payment = Payment(
-        id=uuid.uuid4(),
-        external_ref=ref,
-        enrollment_id=enrollment.id,
-        client_id=client_id,
-        package_id=package_id,
-        amount_paid=amount,
-        balance_after=enrollment.amount_due,
-        method=values["method"],
-        date=_coerce(Payment, "date", values["date"]),
-        created_by=created_by,
-    )
-    db.add(payment)
-    return payment
-
-
-async def _create_enrollment(db: AsyncSession, values: dict, ref: str) -> Enrollment:
-    """An enrollment starts at zero paid — its payments then replay onto it."""
-    price = Decimal(str(values["package_price_snapshot"]))
-    enrollment = Enrollment(
-        id=uuid.uuid4(),
-        external_ref=ref,
-        client_id=uuid.UUID(values["client"]),
-        package_id=uuid.UUID(values["package"]),
-        package_price_snapshot=price,
-        total_paid=Decimal("0"),
-        amount_due=price,
-        status=EnrollmentStatus.ACTIVE,
-        is_overdue=bool(values.get("is_overdue") or False),
-    )
-    # Both are timestamptz columns fed by a DATE field, and both arrive from
-    # JSONB as strings — _coerce widens them to midnight UTC. started_at was
-    # also simply being dropped, so every historical enrollment was landing
-    # with today's date via the column's server_default.
-    if values.get("started_at"):
-        enrollment.started_at = _coerce(Enrollment, "started_at", values["started_at"])
-    if values.get("completed_at"):
-        enrollment.completed_at = _coerce(
-            Enrollment, "completed_at", values["completed_at"]
-        )
-    db.add(enrollment)
-    return enrollment
 
 
 @dataclass
@@ -563,10 +448,7 @@ async def _apply_group(
     updates = [r for r in rows if r.status == ImportRowStatus.UPDATE.value]
 
     if creates:
-        if ctx.entity.key == "payments":
-            outcomes.update(await _insert_payments(db, ctx, batch, creates))
-        else:
-            outcomes.update(await _insert_records(db, ctx, batch, creates))
+        outcomes.update(await _insert_records(db, ctx, batch, creates))
 
     for row in updates:
         outcomes[row.id] = _Outcome(entity_id=row.entity_id)
@@ -585,7 +467,10 @@ def _bind_chunks(rows: list[dict], columns: int) -> list[list[dict]]:
 async def _insert_records(
     db: AsyncSession, ctx: _Ctx, batch: ImportBatch, rows: list[ImportRow]
 ) -> dict[uuid.UUID, _Outcome]:
-    """One batched INSERT per table for everything except payments.
+    """One batched INSERT per table.
+
+    Payments used to need their own path, replaying each enrollment's running
+    balance in date order under a row lock. Flat payments need none of it.
 
     Plain insert, deliberately NOT on_conflict_do_nothing: a conflict here
     means something the preview didn't foresee, and silently swallowing it
@@ -601,12 +486,9 @@ async def _insert_records(
         _apply_location_map(ctx, values)
         ref = values.get(ctx.ref_field) or external_ref_for(batch.id, row.row_number)
 
-        if ctx.entity.key == "enrollments":
-            payload = _enrollment_payload(values, ref)
-        else:
-            payload = _model_kwargs(ctx.entity, values)
-            if ctx.has_ref:
-                payload.setdefault(ctx.ref_field, ref)
+        payload = _model_kwargs(ctx.entity, values)
+        if ctx.has_ref:
+            payload.setdefault(ctx.ref_field, ref)
         payload["id"] = uuid7()
         payloads.append(payload)
         order.append(row)
@@ -671,24 +553,6 @@ def _is_completed(status) -> bool:
     if status is None:
         return False
     return getattr(status, "value", status) == SessionStatus.COMPLETED.value
-
-
-def _enrollment_payload(values: dict, ref: str) -> dict:
-    price = Decimal(str(values["package_price_snapshot"]))
-    payload = {
-        "external_ref": ref,
-        "client_id": uuid.UUID(values["client"]),
-        "package_id": uuid.UUID(values["package"]),
-        "package_price_snapshot": price,
-        "total_paid": Decimal("0"),
-        "amount_due": price,
-        "status": EnrollmentStatus.ACTIVE,
-        "is_overdue": bool(values.get("is_overdue") or False),
-    }
-    for name in ("started_at", "completed_at"):
-        if values.get(name):
-            payload[name] = _coerce(Enrollment, name, values[name])
-    return payload
 
 
 async def _apply_updates(
@@ -808,118 +672,6 @@ async def _apply_tiered(
 
     for part in parts:
         await _apply_tiered(db, ctx, batch, part, outcomes, tier=next_tier)
-
-
-async def _insert_payments(
-    db: AsyncSession, ctx: _Ctx, batch: ImportBatch, rows: list[ImportRow]
-) -> dict[uuid.UUID, _Outcome]:
-    """Payments, batched without breaking the running balance.
-
-    The ledger rule is unchanged: every payment's balance_after is the
-    enrollment's amount_due immediately after that payment is applied, with
-    payments applied in DATE order. Batching only changes where the arithmetic
-    happens — in memory over the whole group instead of one round trip per
-    payment — never what it produces.
-
-    Locks are taken once per distinct enrollment for the whole group, and in a
-    consistently sorted order, so a large import can't deadlock against a
-    clinician recording a payment in the dashboard at the same moment.
-    """
-    by_pair: dict[tuple[uuid.UUID, uuid.UUID], list[ImportRow]] = {}
-    for row in rows:
-        values = row.normalized_payload or {}
-        key = (uuid.UUID(values["client"]), uuid.UUID(values["package"]))
-        by_pair.setdefault(key, []).append(row)
-
-    # One SELECT for every enrollment this group touches. Sorted by id so the
-    # lock order is deterministic across concurrent writers.
-    pairs = sorted(by_pair)
-    existing = (await db.execute(
-        select(Enrollment)
-        .where(
-            tuple_(Enrollment.client_id, Enrollment.package_id).in_(pairs),
-            Enrollment.status == EnrollmentStatus.ACTIVE,
-        )
-        .order_by(Enrollment.id)
-        .with_for_update()
-    )).scalars().all()
-    enrollments = {(e.client_id, e.package_id): e for e in existing}
-
-    # Pairs with no open cycle need one. Falls back to the package's current
-    # price, which is why enrollments are meant to be imported first.
-    missing = [p for p in pairs if p not in enrollments]
-    if missing:
-        prices = dict((await db.execute(
-            select(Package.id, Package.price)
-            .where(Package.id.in_({package_id for _, package_id in missing}))
-        )).all())
-        fresh = []
-        for client_id, package_id in missing:
-            price = prices.get(package_id)
-            if price is None:
-                raise ValueError("Package no longer exists")
-            new = Enrollment(
-                id=uuid7(), client_id=client_id, package_id=package_id,
-                package_price_snapshot=price, total_paid=Decimal("0"),
-                amount_due=price, status=EnrollmentStatus.ACTIVE,
-            )
-            fresh.append(new)
-            enrollments[(client_id, package_id)] = new
-        db.add_all(fresh)
-        await db.flush()
-
-    payments: list[dict] = []
-    outcomes: dict[uuid.UUID, _Outcome] = {}
-
-    for pair in pairs:
-        enrollment = enrollments[pair]
-        paid = Decimal(str(enrollment.total_paid or 0))
-        price = Decimal(str(enrollment.package_price_snapshot or 0))
-
-        # Date order within the enrollment, exactly as the row-by-row path
-        # received them (see _pending_query). Row number breaks ties so the
-        # sequence is deterministic for two payments on the same day.
-        ordered = sorted(
-            by_pair[pair],
-            key=lambda r: (str((r.normalized_payload or {}).get("date") or ""),
-                           r.row_number),
-        )
-
-        for row in ordered:
-            values = dict(row.normalized_payload or {})
-            amount = Decimal(str(values["amount_paid"]))
-            paid += amount
-            remaining = price - paid
-            due = remaining if remaining > 0 else Decimal("0")
-
-            payment_id = uuid7()
-            payments.append({
-                "id": payment_id,
-                "external_ref": values.get(ctx.ref_field)
-                or external_ref_for(batch.id, row.row_number),
-                "enrollment_id": enrollment.id,
-                "client_id": pair[0],
-                "package_id": pair[1],
-                "amount_paid": amount,
-                "balance_after": due,
-                "method": values["method"],
-                "date": _coerce(Payment, "date", values["date"]),
-                "created_by": ctx.created_by,
-            })
-            outcomes[row.id] = _Outcome(entity_id=payment_id)
-
-        # The enrollment's totals move once, to where the whole chain landed.
-        enrollment.total_paid = paid
-        enrollment.amount_due = price - paid if price - paid > 0 else Decimal("0")
-        if paid >= price:
-            enrollment.status = EnrollmentStatus.COMPLETED
-            enrollment.completed_at = datetime.now(timezone.utc)
-            enrollment.is_overdue = False
-
-    for group in _bind_chunks(payments, 10):
-        await db.execute(insert(Payment), group)
-    await db.flush()
-    return outcomes
 
 
 async def commit_chunk(
@@ -1059,7 +811,6 @@ async def rollback_batch(db: AsyncSession, batch: ImportBatch) -> dict:
     rows = list(result.scalars().all())
 
     deleted = reverted = 0
-    touched_enrollments: set[uuid.UUID] = set()
 
     # Withdraw PTO accrued from the sessions this undo is about to delete.
     #
@@ -1120,8 +871,6 @@ async def rollback_batch(db: AsyncSession, batch: ImportBatch) -> dict:
             continue
 
         if row.status == ImportRowStatus.CREATED.value:
-            if entity.key == "payments":
-                touched_enrollments.add(obj.enrollment_id)
             await db.delete(obj)
             deleted += 1
         else:
@@ -1139,45 +888,9 @@ async def rollback_batch(db: AsyncSession, batch: ImportBatch) -> dict:
         row.status = ImportRowStatus.PENDING.value
         row.entity_id = None
 
-    # Deleting transactions invalidates the totals they contributed to, so
-    # every affected enrollment is recomputed from the payments that remain.
-    for enrollment_id in touched_enrollments:
-        await _recompute_enrollment(db, enrollment_id)
-
     batch.status = ImportStatus.ROLLED_BACK.value
     batch.commit_cursor = 0
     await db.commit()
 
     return {"deleted": deleted, "reverted": reverted,
-            "enrollments_recomputed": len(touched_enrollments),
             "pto_accruals_withdrawn": accruals_withdrawn}
-
-
-async def _recompute_enrollment(db: AsyncSession, enrollment_id: uuid.UUID) -> None:
-    """Rebuild an enrollment's money from its surviving payments, in date order."""
-    enrollment = await db.get(Enrollment, enrollment_id)
-    if enrollment is None:
-        return
-
-    result = await db.execute(
-        select(Payment)
-        .where(Payment.enrollment_id == enrollment_id)
-        .order_by(Payment.date, Payment.created_at)
-    )
-    payments = list(result.scalars().all())
-
-    price = Decimal(str(enrollment.package_price_snapshot))
-    running = Decimal("0")
-    for payment in payments:
-        running += Decimal(str(payment.amount_paid))
-        remaining = price - running
-        payment.balance_after = remaining if remaining > 0 else Decimal("0")
-
-    enrollment.total_paid = running
-    remaining = price - running
-    enrollment.amount_due = remaining if remaining > 0 else Decimal("0")
-    if running >= price:
-        enrollment.status = EnrollmentStatus.COMPLETED
-    else:
-        enrollment.status = EnrollmentStatus.ACTIVE
-        enrollment.completed_at = None
