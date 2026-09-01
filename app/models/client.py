@@ -5,7 +5,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID
 
 from app.database import Base
-from app.models.enums import ClientStatus
+from app.models.enums import ContactStatus
 
 
 class Client(Base):
@@ -37,14 +37,16 @@ class Client(Base):
     location_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("locations.id"), nullable=False
     )
-    status: Mapped[ClientStatus] = mapped_column(
+    status: Mapped[ContactStatus] = mapped_column(
         Enum(
-            ClientStatus,
-            name="client_status",
+            ContactStatus,
+            name="contact_status",
             values_callable=lambda enum_cls: [e.value for e in enum_cls],
         ),
         nullable=False,
-        default=ClientStatus.CONSULTATION_COMPLETED,
+        # Only reached by a client created without one (the importer, or a
+        # direct POST). Conversion always carries the lead's own status across.
+        default=ContactStatus.BOOKED,
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

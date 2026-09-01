@@ -16,7 +16,7 @@ from sqlalchemy.orm import selectinload
 
 from app.database import get_db
 from app.models.enrollment import Enrollment
-from app.models.enums import PaymentStatus
+from app.models.enums import PaymentStatus, CONTACT_STATUS_LABELS
 from app.models.user import User
 from app.dependencies.auth import require_admin_or_coordinator
 from app.services.audit_service import record_export
@@ -42,16 +42,11 @@ STATUS_LABELS = {
     PaymentStatus.OVERDUE: "Overdue",
 }
 
-LEAD_STATUS_LABELS = {
-    "new_lead": "New Lead",
-    "contacted": "Contacted",
-    "consultation_scheduled": "Consultation Scheduled",
-    "consultation_completed": "Consultation Completed",
-    "therapy_session_booked": "Therapy Session Booked",
-    "ongoing_therapy": "Ongoing Therapy",
-    "completed_program": "Completed Program",
-    "inactive_client": "Inactive Client",
-}
+# Keyed by the raw enum VALUE, since that is what the export rows carry.
+# Derived from the single label map in models/enums.py rather than restated —
+# a second copy is how a renamed status ends up rendering as "closed_inactive"
+# in the CSV while the dashboard shows it correctly.
+LEAD_STATUS_LABELS = {s.value: label for s, label in CONTACT_STATUS_LABELS.items()}
 
 
 def _num(v) -> float:

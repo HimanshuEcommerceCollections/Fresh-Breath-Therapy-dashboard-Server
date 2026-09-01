@@ -11,7 +11,7 @@ from app.models.therapist import Therapist
 from app.models.location import Location
 from app.models.session import Session as SessionModel
 from app.models.payment import Payment
-from app.models.enums import LeadStatus, SessionStatus
+from app.models.enums import ContactStatus, SessionStatus
 from app.schemas.report import (
     SalesPoint, ClientStatusPoint, TeamPerformancePoint,
     ConversionReport, ConversionStage, UtilizationPoint,
@@ -66,7 +66,7 @@ async def _lead_status_counts(db, location_id, start_date):
         query = query.where(Lead.created_at >= start_date)
     result = await db.execute(query)
     counts = {row[0]: row[1] for row in result.all()}
-    return {s: counts.get(s, 0) for s in LeadStatus}
+    return {s: counts.get(s, 0) for s in ContactStatus}
 
 
 @router.get("/clients", response_model=list[ClientStatusPoint])

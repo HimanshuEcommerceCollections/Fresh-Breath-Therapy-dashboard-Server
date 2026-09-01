@@ -11,7 +11,7 @@ from app.models.location import Location
 from app.models.therapist import Therapist
 from app.models.payment import Payment
 from app.models.session import Session as SessionModel
-from app.models.enums import ClientStatus
+from app.models.enums import ContactStatus
 from app.schemas.client import ClientCreate, ClientUpdate, ClientResponse
 from app.models.user import User
 from app.dependencies.auth import get_current_user, require_admin, get_own_therapist
@@ -60,7 +60,7 @@ async def _attach_computed_fields(db: AsyncSession, clients: list[Client]) -> li
 
 @router.get("", response_model=Page[ClientResponse])
 async def list_clients(
-    status_filter: ClientStatus | None = None,
+    status_filter: ContactStatus | None = None,
     location_id: uuid.UUID | None = None,
     search: str | None = None,
     cursor: str | None = None,

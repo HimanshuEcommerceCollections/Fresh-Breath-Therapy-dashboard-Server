@@ -21,7 +21,7 @@ from app.models.client import Client
 from app.models.enrollment import Enrollment
 from app.models.follow_up import FollowUp
 from app.models.enums import (
-    ClientStatus, EnrollmentStatus, LeadStatus, PaymentMethod,
+    ContactStatus, EnrollmentStatus, PaymentMethod,
     SessionStatus, SessionType,
 )
 from app.models.lead import Lead
@@ -235,7 +235,7 @@ CLIENTS = EntitySpec(
                   aliases=("notes", "comment", "comments", "remark", "remarks",
                            "admin note", "internal note")),
         FieldSpec("status", "Status", FieldKind.ENUM,
-                  writable=Writability.INSERT_ONLY, enum_cls=ClientStatus,
+                  writable=Writability.INSERT_ONLY, enum_cls=ContactStatus,
                   aliases=("client status", "stage", "progress", "phase")),
     ),
 )
@@ -292,7 +292,7 @@ LEADS = EntitySpec(
                   aliases=("admin note", "internal note", "staff note",
                            "remark", "remarks")),
         FieldSpec("status", "Status", FieldKind.ENUM,
-                  writable=Writability.INSERT_ONLY, enum_cls=LeadStatus,
+                  writable=Writability.INSERT_ONLY, enum_cls=ContactStatus,
                   aliases=("lead status", "stage", "pipeline", "progress")),
         FieldSpec("converted_client", "Converted to client", FieldKind.FK,
                   writable=Writability.INSERT_ONLY, fk_entity="clients",

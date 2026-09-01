@@ -5,7 +5,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID
 
 from app.database import Base
-from app.models.enums import LeadStatus
+from app.models.enums import ContactStatus
 
 
 class Lead(Base):
@@ -60,14 +60,14 @@ class Lead(Base):
     converted_client_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("clients.id"), nullable=True
     )
-    status: Mapped[LeadStatus] = mapped_column(
+    status: Mapped[ContactStatus] = mapped_column(
         Enum(
-            LeadStatus,
-            name="lead_status",
+            ContactStatus,
+            name="contact_status",
             values_callable=lambda enum_cls: [e.value for e in enum_cls],
         ),
         nullable=False,
-        default=LeadStatus.NEW_LEAD,
+        default=ContactStatus.NEW_LEAD,
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

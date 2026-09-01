@@ -14,7 +14,9 @@ from app.models.session import Session as SessionModel
 from app.models.payment import Payment
 from app.models.enrollment import Enrollment
 from app.models.follow_up import FollowUp
-from app.models.enums import LeadStatus, ClientStatus, SessionStatus, EnrollmentStatus, PaymentStatus
+from app.models.enums import (
+    ContactStatus, INACTIVE_STATUS, SessionStatus, EnrollmentStatus, PaymentStatus,
+)
 from app.schemas.dashboard import (
     DashboardResponse, LeadStat, ClientStat, SessionMetrics, RevenueMetrics,
     RevenueTrendPoint, PaymentStatusCount, FunnelStage, UpcomingSessionItem,
@@ -59,7 +61,7 @@ async def get_dashboard(
     totals = (await db.execute(select(
         _count(Lead).label("total_leads"),
         _count(Lead, Lead.created_at >= month_start).label("new_leads"),
-        _count(Client, Client.status != ClientStatus.COMPLETED_PROGRAM).label("active_clients"),
+        _count(Client, Client.status != INACTIVE_STATUS).label("active_clients"),
         _count(Client, Client.created_at >= thirty_days_ago).label("new_clients"),
         _count(FollowUp, FollowUp.due_date >= today,
                FollowUp.completed_at.is_(None)).label("pending_follow_ups"),
@@ -181,7 +183,7 @@ async def get_dashboard(
     )).all()
     funnel_counts = {row[0]: row[1] for row in funnel_rows}
     lead_funnel = [
-        FunnelStage(status=s.value, count=funnel_counts.get(s, 0)) for s in LeadStatus
+        FunnelStage(status=s.value, count=funnel_counts.get(s, 0)) for s in ContactStatus
     ]
 
     # Upcoming sessions — one JOIN query, no per-row lookups

@@ -12,7 +12,7 @@ from app.models.location import Location
 from app.models.client import Client
 from app.models.payment import Payment
 from app.models.pto_transaction import PtoTransaction
-from app.models.enums import ClientStatus
+from app.models.enums import ACTIVE_STATUSES
 from app.schemas.therapist import TherapistCreate, TherapistUpdate, TherapistResponse
 from app.models.user import User
 from app.dependencies.auth import get_current_user, get_own_therapist, require_admin
@@ -21,7 +21,11 @@ from app.services.cloudinary_service import delete_avatar, upload_avatar
 
 router = APIRouter(prefix="/api/therapists", tags=["therapists"])
 
-ACTIVE_CLIENT_STATUSES = (ClientStatus.THERAPY_SESSION_BOOKED, ClientStatus.ONGOING_THERAPY)
+# Every status except CLOSED_INACTIVE. Previously this was a hand-picked pair
+# (booked + ongoing), which quietly excluded clients who were mid-intake from
+# their therapist's caseload. "Active means not closed" is now the single rule,
+# defined once in models/enums.py.
+ACTIVE_CLIENT_STATUSES = ACTIVE_STATUSES
 
 
 async def _attach_computed_fields(db: AsyncSession, therapists: list[Therapist]) -> list[TherapistResponse]:

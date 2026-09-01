@@ -4,7 +4,7 @@ from pydantic import BaseModel, EmailStr, Field, field_validator
 from app.schemas.base import ORMBase
 from app.schemas.location import LocationResponse
 from app.schemas.therapist import TherapistResponse
-from app.models.enums import LeadStatus
+from app.models.enums import ContactStatus
 # The phone rule moved to fields.py when clients gained a phone column too —
 # one definition, so the two entry points can't drift apart.
 from app.schemas.fields import (
@@ -24,7 +24,7 @@ class LeadCreate(BaseModel):
     # The admin's own note, not the website form's `message` — that one is
     # written by the client and is never accepted from this endpoint.
     note: Note | None = None
-    status: LeadStatus = LeadStatus.NEW_LEAD
+    status: ContactStatus = ContactStatus.NEW_LEAD
 
     _validate_phone = field_validator("phone")(_validate_phone)
 
@@ -39,7 +39,7 @@ class LeadUpdate(BaseModel):
     therapist_id: uuid.UUID | None = None
     source: str | None = None
     note: Note | None = None
-    status: LeadStatus | None = None
+    status: ContactStatus | None = None
 
     _validate_phone = field_validator("phone")(_validate_phone)
 
@@ -62,7 +62,7 @@ class LeadResponse(ORMBase):
     customer_id: str | None = None
     payment_status: str | None = None
     visit_status: str | None = None
-    status: LeadStatus
+    status: ContactStatus
     converted_client_id: uuid.UUID | None
     created_at: datetime
     updated_at: datetime

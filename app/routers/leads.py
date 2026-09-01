@@ -9,7 +9,7 @@ from app.models.lead import Lead
 from app.models.location import Location
 from app.models.therapist import Therapist
 from app.models.client import Client
-from app.models.enums import LeadStatus
+from app.models.enums import ContactStatus
 from app.schemas.lead import LeadCreate, LeadUpdate, LeadResponse
 from app.schemas.client import ClientResponse
 from app.models.user import User
@@ -31,7 +31,7 @@ def _lead_query():
 
 @router.get("", response_model=Page[LeadResponse])
 async def list_leads(
-    status_filter: LeadStatus | None = None,
+    status_filter: ContactStatus | None = None,
     location_id: uuid.UUID | None = None,
     search: str | None = None,
     cursor: str | None = None,
@@ -190,6 +190,10 @@ async def convert_lead(
         # The admin's note follows the person, not the record type — it is the
         # same standing fact about them either side of the conversion.
         note=lead.note,
+        # Carried across, not defaulted. Leads and clients share one status
+        # vocabulary precisely so a conversion needs no translation: whatever
+        # the admin last set on the lead is where this person actually is.
+        status=lead.status,
         therapist_id=lead.therapist_id,
         location_id=lead.location_id,
     )
