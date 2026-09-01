@@ -58,6 +58,14 @@ async def get_security_settings(
         else f"{retention_years} years"
     )
 
+    session_hours = settings.SESSION_ABSOLUTE_HOURS
+    session_label = f"{session_hours} hour" + ("" if session_hours == 1 else "s")
+    # True once the idle window is widened to meet the absolute cap: nothing
+    # ends a session on inactivity any more, so the copy must not claim it does.
+    idle_never_fires = (
+        settings.ACCESS_TOKEN_EXPIRE_MINUTES >= session_hours * 60
+    )
+
     return SecuritySettingsResponse(controls=[
         SecurityControl(
             key="audit_logging",
@@ -80,12 +88,20 @@ async def get_security_settings(
         ),
         SecurityControl(
             key="idle_logout",
-            label="Automatic logoff when idle",
+            label="Automatic logoff",
+            # Honest about which of the two windows is actually doing the work.
+            # Once the idle window is widened to the absolute cap, nothing ends
+            # a session on inactivity any more, and saying "ends after N minutes
+            # with no activity" would overstate the control.
             enabled=True,
             detail=(
-                f"A session ends after {settings.ACCESS_TOKEN_EXPIRE_MINUTES} minutes "
-                f"with no activity, and after {settings.SESSION_ABSOLUTE_HOURS} hours "
-                "regardless of activity."
+                f"Every session ends {session_label} after sign-in, and the user "
+                "signs in again."
+                + (
+                    "" if idle_never_fires
+                    else f" A session left idle for "
+                         f"{settings.ACCESS_TOKEN_EXPIRE_MINUTES} minutes ends sooner."
+                )
             ),
         ),
         SecurityControl(
