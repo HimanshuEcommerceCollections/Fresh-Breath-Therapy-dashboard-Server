@@ -6,6 +6,8 @@ from sqlalchemy.orm import selectinload
 from app.database import get_db
 from app.models.session import Session
 from app.models.client import Client
+from app.models.lead import Lead
+from app.models.payment import Payment
 from app.models.therapist import Therapist
 from app.models.enums import SessionStatus
 from app.schemas.session import (
@@ -26,8 +28,23 @@ router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
 def _session_query():
     return select(Session).options(
-        selectinload(Session.client), selectinload(Session.therapist)
+        selectinload(Session.client),
+        selectinload(Session.lead),
+        selectinload(Session.therapist),
+        selectinload(Session.payment),
     )
+
+
+async def _load_subject(db: AsyncSession, client_id, lead_id):
+    """Verify the session's subject exists before anything is written.
+
+    Returns nothing useful — it raises. Shared by create and update so the two
+    cannot disagree about what a valid subject is.
+    """
+    if client_id is not None and await db.get(Client, client_id) is None:
+        raise HTTPException(status_code=400, detail="Client does not exist")
+    if lead_id is not None and await db.get(Lead, lead_id) is None:
+        raise HTTPException(status_code=400, detail="Lead does not exist")
 
 
 @router.post("/search", response_model=Page[SessionResponse])
@@ -48,19 +65,24 @@ async def search_sessions(
 
     if payload.client_id:
         query = query.where(Session.client_id == payload.client_id)
+    if payload.lead_id:
+        query = query.where(Session.lead_id == payload.lead_id)
     if payload.status:
         query = query.where(Session.status == payload.status)
 
     if payload.search and payload.search.strip():
-        # Matched against both names, because the admin remembers one of them
-        # and not which. EXISTS subqueries rather than joins: a join would
-        # duplicate rows and, more importantly, interfere with the keyset
-        # pagination applied below, which assumes one row per session.
+        # Matched against every name the admin might remember: the subject's,
+        # whether they are a lead or a client, and the therapist's. Subqueries
+        # rather than joins — a join would duplicate rows and interfere with
+        # the keyset pagination below, which assumes one row per session.
         term = f"%{payload.search.strip()}%"
         query = query.where(
             or_(
                 Session.client_id.in_(
                     select(Client.id).where(Client.name.ilike(term))
+                ),
+                Session.lead_id.in_(
+                    select(Lead.id).where(Lead.name.ilike(term))
                 ),
                 Session.therapist_id.in_(
                     select(Therapist.id).where(Therapist.name.ilike(term))
@@ -84,10 +106,11 @@ async def search_sessions(
         criteria={
             "status": payload.status.value if payload.status else None,
             "client_id": str(payload.client_id) if payload.client_id else None,
+            "lead_id": str(payload.lead_id) if payload.lead_id else None,
             "therapist_ids": [str(t) for t in (payload.therapist_ids or [])] or None,
             "date_from": payload.date_from.isoformat() if payload.date_from else None,
             "date_to": payload.date_to.isoformat() if payload.date_to else None,
-            # Matches client and therapist names, so the term itself is PHI.
+            # Matches lead, client and therapist names, so the term is PHI.
             "searched": bool(payload.search and payload.search.strip()),
             "limit": limit,
             "paged": bool(payload.cursor),
@@ -125,17 +148,39 @@ async def create_session(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_admin()),
 ):
-    client = await db.get(Client, payload.client_id)
-    if client is None:
-        raise HTTPException(status_code=400, detail="Client does not exist")
+    # Exactly one of client_id / lead_id is guaranteed by SessionCreate.
+    await _load_subject(db, payload.client_id, payload.lead_id)
     therapist = await db.get(Therapist, payload.therapist_id)
     if therapist is None:
         raise HTTPException(status_code=400, detail="Therapist does not exist")
 
     await check_double_booking(db, payload.therapist_id, payload.date, payload.time)
 
-    session = Session(id=uuid.uuid4(), **payload.model_dump())
+    # ── session + payment, one transaction ────────────────────────────────
+    #
+    # Booking an appointment and recording what it costs are one action. Both
+    # rows are added and committed together, so a payment that fails to write
+    # takes the session with it and the admin retries a whole booking rather
+    # than discovering an unbilled session later.
+    #
+    # Nothing here needs a try/except: any error escaping this handler leaves
+    # the transaction uncommitted, and get_db rolls it back. The atomicity
+    # comes from the single commit, not from catching anything.
+    session_fields = payload.model_dump(exclude={"payment"})
+    session = Session(id=uuid.uuid4(), **session_fields)
     db.add(session)
+
+    session.payment = Payment(
+        id=uuid.uuid4(),
+        amount=payload.payment.amount,
+        method=payload.payment.method,
+        status=payload.payment.status,
+        # Dated to the session rather than taken from the caller: a payment
+        # for an appointment is dated to that appointment, and a second date
+        # field could only ever contradict it.
+        date=payload.date,
+        created_by=current_user.id,
+    )
 
     if session.status == SessionStatus.COMPLETED:
         await accrue_pto_for_completed_session(db, session.id, session.therapist_id)
@@ -177,9 +222,27 @@ async def update_session(
     if update_data.get("therapist_id"):
         if await db.get(Therapist, update_data["therapist_id"]) is None:
             raise HTTPException(status_code=400, detail="Therapist does not exist")
-    if update_data.get("client_id"):
-        if await db.get(Client, update_data["client_id"]) is None:
-            raise HTTPException(status_code=400, detail="Client does not exist")
+
+    # Reassigning the subject. Checked against the session's RESULTING state
+    # rather than the payload alone, because moving a session from a lead to a
+    # client means setting one field and clearing the other, and a payload that
+    # only sets client_id would otherwise leave both populated and trip
+    # ck_sessions_one_subject as a 500.
+    if {"client_id", "lead_id"} & update_data.keys():
+        new_client_id = update_data.get("client_id", session.client_id)
+        new_lead_id = update_data.get("lead_id", session.lead_id)
+        if "client_id" in update_data and update_data["client_id"] is not None:
+            new_lead_id = None
+        if "lead_id" in update_data and update_data["lead_id"] is not None:
+            new_client_id = None
+        if (new_client_id is None) == (new_lead_id is None):
+            raise HTTPException(
+                status_code=400,
+                detail="A session must have exactly one subject - a lead or a client",
+            )
+        await _load_subject(db, new_client_id, new_lead_id)
+        update_data["client_id"] = new_client_id
+        update_data["lead_id"] = new_lead_id
 
     new_date = update_data.get("date", session.date)
     new_time = update_data.get("time", session.time)

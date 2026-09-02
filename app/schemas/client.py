@@ -5,9 +5,9 @@ from pydantic import BaseModel, EmailStr, Field, field_validator
 from app.schemas.base import ORMBase
 from app.schemas.location import LocationResponse
 from app.schemas.therapist import TherapistResponse
-from app.models.enums import ClientStatus
+from app.models.enums import ContactStatus
 from app.schemas.fields import (
-    MAX_PHONE_LENGTH, MIN_PHONE_LENGTH, PersonName, Email, validate_phone,
+    MAX_PHONE_LENGTH, MIN_PHONE_LENGTH, PersonName, Email, Note, validate_phone,
 )
 
 
@@ -22,7 +22,10 @@ class ClientCreate(BaseModel):
     )
     therapist_id: uuid.UUID
     location_id: uuid.UUID
-    status: ClientStatus = ClientStatus.CONSULTATION_COMPLETED
+    # Copied from the lead on conversion; editable afterwards like any other
+    # detail. Same 100-character rule as Lead.note.
+    note: Note | None = None
+    status: ContactStatus = ContactStatus.BOOKED
 
     _validate_phone = field_validator("phone")(validate_phone)
 
@@ -35,7 +38,8 @@ class ClientUpdate(BaseModel):
     )
     therapist_id: uuid.UUID | None = None
     location_id: uuid.UUID | None = None
-    status: ClientStatus | None = None
+    note: Note | None = None
+    status: ContactStatus | None = None
 
     _validate_phone = field_validator("phone")(validate_phone)
 
@@ -45,7 +49,8 @@ class ClientResponse(ORMBase):
     name: str
     email: str
     phone: str | None = None
-    status: ClientStatus
+    note: str | None = None
+    status: ContactStatus
     created_at: datetime
     location: LocationResponse
     therapist: TherapistResponse

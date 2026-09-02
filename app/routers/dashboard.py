@@ -2,7 +2,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, case, literal
+from sqlalchemy import select, func
 
 from app.database import get_db
 from app.services.audit_service import record_read
@@ -12,9 +12,11 @@ from app.models.therapist import Therapist
 from app.models.location import Location
 from app.models.session import Session as SessionModel
 from app.models.payment import Payment
-from app.models.enrollment import Enrollment
 from app.models.follow_up import FollowUp
-from app.models.enums import LeadStatus, ClientStatus, SessionStatus, EnrollmentStatus, PaymentStatus
+from app.models.enums import (
+    ContactStatus, INACTIVE_STATUS, SessionStatus, PaymentStatus,
+    COLLECTED_STATUSES, OUTSTANDING_STATUSES,
+)
 from app.schemas.dashboard import (
     DashboardResponse, LeadStat, ClientStat, SessionMetrics, RevenueMetrics,
     RevenueTrendPoint, PaymentStatusCount, FunnelStage, UpcomingSessionItem,
@@ -59,18 +61,17 @@ async def get_dashboard(
     totals = (await db.execute(select(
         _count(Lead).label("total_leads"),
         _count(Lead, Lead.created_at >= month_start).label("new_leads"),
-        _count(Client, Client.status != ClientStatus.COMPLETED_PROGRAM).label("active_clients"),
+        _count(Client, Client.status != INACTIVE_STATUS).label("active_clients"),
         _count(Client, Client.created_at >= thirty_days_ago).label("new_clients"),
         _count(FollowUp, FollowUp.due_date >= today,
                FollowUp.completed_at.is_(None)).label("pending_follow_ups"),
         _count(SessionModel, SessionModel.date == today).label("sessions_today"),
         _count(SessionModel, SessionModel.status == SessionStatus.SCHEDULED,
                SessionModel.date >= today).label("upcoming"),
-        _sum(Enrollment.package_price_snapshot).label("revenue_totals"),
-        _sum(Payment.amount_paid).label("collected"),
-        _sum(Enrollment.amount_due,
-             Enrollment.status == EnrollmentStatus.ACTIVE).label("pending_payments"),
-        _sum(Payment.amount_paid, Payment.date >= month_start).label("monthly_revenue"),
+        _sum(Payment.amount, Payment.status.in_(COLLECTED_STATUSES)).label("collected"),
+        _sum(Payment.amount, Payment.status.in_(OUTSTANDING_STATUSES)).label("pending_payments"),
+        _sum(Payment.amount, Payment.status.in_(COLLECTED_STATUSES),
+             Payment.date >= month_start).label("monthly_revenue"),
     ))).one()
 
     total_leads = totals.total_leads
@@ -97,13 +98,13 @@ async def get_dashboard(
         today=sessions_today,
     )
 
-    # Revenue — total_revenue is the total contracted value of every
-    # enrollment ever started (active + completed); collected is actual cash
-    # taken in via the payments ledger. Neither figure lives on a single row
-    # anymore now that "due" isn't stored per-payment — see Enrollment.
-    total_revenue = Decimal(str(totals.revenue_totals))
+    # Revenue. With packages gone there is no contracted value to total: a
+    # session costs what it costs. So total_revenue is simply everything billed
+    # and not written off — collected plus still-outstanding. CANCELLED
+    # payments are in neither, which is the point of that status.
     collected = Decimal(str(totals.collected))
     pending_payments = Decimal(str(totals.pending_payments))
+    total_revenue = collected + pending_payments
 
     # Quantize to cents — an unrounded Decimal division serialises as a
     # 24-decimal-place string in the JSON response.
@@ -122,27 +123,25 @@ async def get_dashboard(
         avg_per_client=avg_per_client,
     )
 
-    # Revenue trend — "collected" is cash actually taken in that month
-    # (sum of ledger rows dated in it). "pending" is the amount still owed,
-    # as of today, from enrollments that were STARTED in that month — a
-    # ledger has no per-historical-month "amount still due" figure the way
-    # a due/paid snapshot row used to, so this is the closest still-useful
-    # analogue: "how much of the business opened that month is unpaid now".
-    collected_month_expr = func.to_char(Payment.date, "YYYY-MM").label("month")
-    collected_rows = (await db.execute(
-        select(collected_month_expr, func.coalesce(func.sum(Payment.amount_paid), 0))
+    # Revenue trend. Both series now come from the same table and the same
+    # date column, split only by status — so "collected" and "pending" for a
+    # month are directly comparable. They were not before: collected was cash
+    # dated in the month, while pending was today's outstanding balance on
+    # enrollments STARTED that month, which answered a different question and
+    # moved every time anyone paid anything.
+    month_expr = func.to_char(Payment.date, "YYYY-MM").label("month")
+    trend_rows = (await db.execute(
+        select(month_expr, Payment.status, func.coalesce(func.sum(Payment.amount), 0))
         .where(Payment.date >= six_months_ago)
-        .group_by(collected_month_expr)
+        .group_by(month_expr, Payment.status)
     )).all()
-    collected_by_month = {row[0]: Decimal(str(row[1])) for row in collected_rows}
-
-    pending_month_expr = func.to_char(Enrollment.started_at, "YYYY-MM").label("month")
-    pending_rows = (await db.execute(
-        select(pending_month_expr, func.coalesce(func.sum(Enrollment.amount_due), 0))
-        .where(Enrollment.started_at >= six_months_ago, Enrollment.status == EnrollmentStatus.ACTIVE)
-        .group_by(pending_month_expr)
-    )).all()
-    pending_by_month = {row[0]: Decimal(str(row[1])) for row in pending_rows}
+    collected_by_month: dict[str, Decimal] = {}
+    pending_by_month: dict[str, Decimal] = {}
+    for month, pay_status, total in trend_rows:
+        if pay_status in COLLECTED_STATUSES:
+            collected_by_month[month] = Decimal(str(total))
+        elif pay_status in OUTSTANDING_STATUSES:
+            pending_by_month[month] = Decimal(str(total))
 
     all_months = sorted(set(collected_by_month) | set(pending_by_month))
     revenue_trend = [
@@ -154,21 +153,14 @@ async def get_dashboard(
         for month in all_months
     ]
 
-    # Invoice payment-status distribution — the same four states the Payments
-    # page shows (paid / partially paid / pending / overdue), derived in SQL so
-    # this donut can't disagree with that table. Mirrors
-    # Enrollment.payment_status; keep the two in step if either changes.
-    status_expr = case(
-        (Enrollment.is_overdue.is_(True), literal(PaymentStatus.OVERDUE.value)),
-        (Enrollment.total_paid <= 0, literal(PaymentStatus.PENDING.value)),
-        (Enrollment.total_paid >= Enrollment.package_price_snapshot,
-         literal(PaymentStatus.PAID.value)),
-        else_=literal(PaymentStatus.PARTIALLY_PAID.value),
-    )
+    # Payment-status distribution. Previously a four-branch CASE reconstructing
+    # Enrollment.payment_status in SQL, with a comment asking whoever touched
+    # either to keep them in step. The status is stored now, so there is one
+    # definition and nothing to keep in step.
     status_rows = (await db.execute(
-        select(status_expr.label("s"), func.count(Enrollment.id)).group_by(status_expr)
+        select(Payment.status, func.count(Payment.id)).group_by(Payment.status)
     )).all()
-    counts_by_status = {row[0]: row[1] for row in status_rows}
+    counts_by_status = {row[0].value: row[1] for row in status_rows}
     payment_status = [
         PaymentStatusCount(status=s.value, count=counts_by_status.get(s.value, 0))
         for s in PaymentStatus
@@ -181,13 +173,23 @@ async def get_dashboard(
     )).all()
     funnel_counts = {row[0]: row[1] for row in funnel_rows}
     lead_funnel = [
-        FunnelStage(status=s.value, count=funnel_counts.get(s, 0)) for s in LeadStatus
+        FunnelStage(status=s.value, count=funnel_counts.get(s, 0)) for s in ContactStatus
     ]
 
-    # Upcoming sessions — one JOIN query, no per-row lookups
+    # Upcoming sessions — one JOIN query, no per-row lookups.
+    #
+    # OUTER joins to both clients and leads, because a session now belongs to
+    # exactly one of them. An inner join to clients — which is what this was —
+    # silently dropped every lead's session from the list, so booking a
+    # consultation for a new enquiry left the dashboard looking empty.
     upcoming_rows = (await db.execute(
-        select(SessionModel, Client.name, Therapist.name)
-        .join(Client, SessionModel.client_id == Client.id)
+        select(
+            SessionModel,
+            func.coalesce(Client.name, Lead.name),
+            Therapist.name,
+        )
+        .outerjoin(Client, SessionModel.client_id == Client.id)
+        .outerjoin(Lead, SessionModel.lead_id == Lead.id)
         .join(Therapist, SessionModel.therapist_id == Therapist.id)
         .where(SessionModel.status == SessionStatus.SCHEDULED, SessionModel.date >= today)
         .order_by(SessionModel.date, SessionModel.time)

@@ -8,13 +8,19 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     # This doubles as the IDLE window. The token is re-issued while the user is
     # active (see dependencies/auth.py), so it only actually expires after this
-    # long with no requests at all — which is what "automatic logoff after 30
+    # long with no requests at all — which is what "automatic logoff after N
     # minutes idle" means to the person using it.
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    #
+    # Set to match SESSION_ABSOLUTE_HOURS below, deliberately. At 30 minutes
+    # the admins running the dashboard were being signed out mid-shift for
+    # stepping away, so the idle window no longer ends a session early: the
+    # absolute ceiling is the only thing that does.
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 240
     # Hard ceiling regardless of activity, so a session cannot slide forever on
-    # a machine somebody left open. A shift is under 12 hours; anyone still
-    # working past it signs in again.
-    SESSION_ABSOLUTE_HOURS: int = 12
+    # a machine somebody left open. With the idle window widened to match, this
+    # is now THE session length: four hours after signing in you are signed out,
+    # whatever you were doing.
+    SESSION_ABSOLUTE_HOURS: int = 4
     # Do not mint a new token on every single request — that would be a
     # Set-Cookie on every response for no benefit. Re-issue only once the
     # current one is this old, so a busy user gets a handful per hour.

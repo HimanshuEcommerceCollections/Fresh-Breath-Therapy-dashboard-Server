@@ -5,44 +5,55 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID
 
 from app.database import Base
-from app.models.enums import PaymentMethod
+from app.models.enums import PaymentMethod, PaymentStatus
 
 
 class Payment(Base):
-    """Immutable ledger of individual payment transactions against an
-    Enrollment. client_id/package_id are denormalized from the enrollment at
-    insert time (never change afterward) so the hot-path queries — a
-    client's payment history, a client's lifetime value, revenue-by-client
-    joins in therapists/dashboard — filter this table directly instead of
-    joining through enrollments every time. enrollment_id is still the
-    source of truth for the running total_paid/amount_due/status."""
+    """What one session cost and whether it has been paid.
+
+    Flat, by design. This used to be a ledger row against an Enrollment - a
+    client's purchase-cycle of a Package - carrying a running balance, a
+    denormalized package_id, and a status derived from how much of the package
+    price had been settled. The practice does not sell packages: someone comes
+    for therapy and pays for that session. Enrollments and packages are gone,
+    and with them the running total, the balance_after snapshot and the
+    derivation. A payment is now simply an amount, a method and a status.
+
+    `amount` (was `amount_paid`) because a PENDING row records money expected,
+    not money received - the old name contradicted the row it described.
+
+    ONE PAYMENT PER SESSION, and never without one. session_id is NOT NULL and
+    UNIQUE, and the pair is created in a single transaction by the scheduling
+    endpoint. Two consequences worth knowing:
+
+      - There is no client_id here. The person is whoever the session is for,
+        which may be a lead. That also means converting a lead moves their
+        payments for free: repointing the SESSION carries the payment with it.
+      - ondelete="CASCADE": deleting a session takes its payment with it,
+        because money recorded for an appointment that no longer exists is
+        orphaned. The unique constraint is what makes that safe to reason
+        about - there is only ever one row to remove.
+    """
 
     __tablename__ = "payments"
     __table_args__ = (
-        Index("ix_payments_enrollment_date", "enrollment_id", "date"),
-        Index("ix_payments_client_package", "client_id", "package_id"),
+        Index("ix_payments_date", "date"),
+        Index("ix_payments_status", "status"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-    # See models/import_batch.py. The ledger is append-only, so on a re-sync
-    # this is what proves a transaction has already been imported and must
-    # not be added a second time.
+    # See models/import_batch.py - proves a transaction has already been
+    # imported and must not be added a second time on a re-sync.
     external_ref: Mapped[str | None] = mapped_column(String, nullable=True, unique=True)
-    enrollment_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("enrollments.id"), nullable=False
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
     )
-    client_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("clients.id"), nullable=False
-    )
-    package_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("packages.id"), nullable=False
-    )
-    amount_paid: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
-    # The enrollment's amount_due immediately after this payment was applied
-    # — a point-in-time fact for history display, never recomputed later.
-    balance_after: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    amount: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
     method: Mapped[PaymentMethod] = mapped_column(
         Enum(
             PaymentMethod,
@@ -51,6 +62,15 @@ class Payment(Base):
         ),
         nullable=False,
     )
+    status: Mapped[PaymentStatus] = mapped_column(
+        Enum(
+            PaymentStatus,
+            name="payment_status",
+            values_callable=lambda enum_cls: [e.value for e in enum_cls],
+        ),
+        nullable=False,
+        default=PaymentStatus.PENDING,
+    )
     date: Mapped[date] = mapped_column(Date, nullable=False)
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
@@ -58,7 +78,8 @@ class Payment(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
-    enrollment: Mapped["Enrollment"] = relationship()
-    client: Mapped["Client"] = relationship()
-    package: Mapped["Package"] = relationship()
+    session: Mapped["Session"] = relationship(back_populates="payment")

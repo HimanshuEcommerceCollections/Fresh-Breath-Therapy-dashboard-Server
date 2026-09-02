@@ -11,8 +11,9 @@ from app.models.therapist import Therapist
 from app.models.location import Location
 from app.models.client import Client
 from app.models.payment import Payment
+from app.models.session import Session as SessionModel
 from app.models.pto_transaction import PtoTransaction
-from app.models.enums import ClientStatus
+from app.models.enums import ACTIVE_STATUSES, COLLECTED_STATUSES
 from app.schemas.therapist import TherapistCreate, TherapistUpdate, TherapistResponse
 from app.models.user import User
 from app.dependencies.auth import get_current_user, get_own_therapist, require_admin
@@ -21,7 +22,11 @@ from app.services.cloudinary_service import delete_avatar, upload_avatar
 
 router = APIRouter(prefix="/api/therapists", tags=["therapists"])
 
-ACTIVE_CLIENT_STATUSES = (ClientStatus.THERAPY_SESSION_BOOKED, ClientStatus.ONGOING_THERAPY)
+# Every status except CLOSED_INACTIVE. Previously this was a hand-picked pair
+# (booked + ongoing), which quietly excluded clients who were mid-intake from
+# their therapist's caseload. "Active means not closed" is now the single rule,
+# defined once in models/enums.py.
+ACTIVE_CLIENT_STATUSES = ACTIVE_STATUSES
 
 
 async def _attach_computed_fields(db: AsyncSession, therapists: list[Therapist]) -> list[TherapistResponse]:
@@ -38,10 +43,11 @@ async def _attach_computed_fields(db: AsyncSession, therapists: list[Therapist])
     active_clients_by_therapist = {row[0]: row[1] for row in active_client_rows}
 
     revenue_rows = (await db.execute(
-        select(Client.therapist_id, func.coalesce(func.sum(Payment.amount_paid), 0))
-        .join(Payment, Payment.client_id == Client.id)
-        .where(Client.therapist_id.in_(therapist_ids))
-        .group_by(Client.therapist_id)
+        select(SessionModel.therapist_id, func.coalesce(func.sum(Payment.amount), 0))
+        .join(Payment, Payment.session_id == SessionModel.id)
+        .where(SessionModel.therapist_id.in_(therapist_ids),
+               Payment.status.in_(COLLECTED_STATUSES))
+        .group_by(SessionModel.therapist_id)
     )).all()
     revenue_by_therapist = {row[0]: Decimal(str(row[1])) for row in revenue_rows}
 

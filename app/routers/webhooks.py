@@ -28,7 +28,7 @@ from app.config import settings
 from app.database import get_db
 from app.models.lead import Lead
 from app.models.location import Location
-from app.models.enums import LeadStatus
+from app.models.enums import ContactStatus
 from app.schemas.fields import MAX_NAME_LENGTH
 from app.schemas.webhook import LeadWebhookPayload, LeadWebhookResult
 from app.services.notification_service import create_notification
@@ -155,7 +155,7 @@ async def _create_or_get_lead(payload: LeadWebhookPayload, db: AsyncSession) -> 
         customer_id=payload.customer_id,
         payment_status=payload.payment_status,
         visit_status=payload.visit_status,
-        status=LeadStatus.NEW_LEAD,
+        status=ContactStatus.NEW_LEAD,
     )
     db.add(lead)
 

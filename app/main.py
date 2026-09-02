@@ -22,8 +22,8 @@ from app.services.audit_listener import register_audit_listener
 from app.services.log_redaction import install_phi_log_redaction
 from app.routers import (
     auth, locations, therapists, leads, clients, follow_up,
-    organization, roles, packages, feature_flags,
-    payments, enrollments, reports, oauth_google, uploads, sessions, dashboard,
+    organization, roles, feature_flags,
+    payments, reports, oauth_google, uploads, sessions, dashboard,
     pto, notifications, client_messages, internal, exports, webhooks, imports,
     audit_logs, security_settings,
 )
@@ -144,10 +144,8 @@ app.include_router(clients.router)
 app.include_router(follow_up.router)
 app.include_router(organization.router)
 app.include_router(roles.router)
-app.include_router(packages.router)
 app.include_router(feature_flags.router)
 app.include_router(payments.router)
-app.include_router(enrollments.router)
 app.include_router(reports.router)
 app.include_router(oauth_google.router)
 app.include_router(uploads.router)

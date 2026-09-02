@@ -5,7 +5,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID
 
 from app.database import Base
-from app.models.enums import LeadStatus
+from app.models.enums import ContactStatus
 
 
 class Lead(Base):
@@ -52,17 +52,22 @@ class Lead(Base):
     customer_id: Mapped[str | None] = mapped_column(String, nullable=True)
     payment_status: Mapped[str | None] = mapped_column(String, nullable=True)
     visit_status: Mapped[str | None] = mapped_column(String, nullable=True)
+    # The admin's own short note about this person — "prefers mornings",
+    # "insurance pending". Distinct from `message`, which is what the CLIENT
+    # wrote on the website form and is never edited. Copied onto the client
+    # on conversion, so clients carry the identical column.
+    note: Mapped[str | None] = mapped_column(String(100), nullable=True)
     converted_client_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("clients.id"), nullable=True
     )
-    status: Mapped[LeadStatus] = mapped_column(
+    status: Mapped[ContactStatus] = mapped_column(
         Enum(
-            LeadStatus,
-            name="lead_status",
+            ContactStatus,
+            name="contact_status",
             values_callable=lambda enum_cls: [e.value for e in enum_cls],
         ),
         nullable=False,
-        default=LeadStatus.NEW_LEAD,
+        default=ContactStatus.NEW_LEAD,
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

@@ -82,7 +82,6 @@ _RESOURCE_FROM_PREFIX = {
     "leads": "lead",
     "sessions": "session",
     "payments": "payment",
-    "enrollments": "enrollment",
     "follow-ups": "follow_up",
     "client-messages": "client_message",
     "therapists": "therapist",

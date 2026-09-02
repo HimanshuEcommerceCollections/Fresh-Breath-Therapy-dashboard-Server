@@ -11,7 +11,7 @@ from app.models.therapist import Therapist
 from app.models.location import Location
 from app.models.session import Session as SessionModel
 from app.models.payment import Payment
-from app.models.enums import LeadStatus, SessionStatus
+from app.models.enums import ContactStatus, SessionStatus, COLLECTED_STATUSES
 from app.schemas.report import (
     SalesPoint, ClientStatusPoint, TeamPerformancePoint,
     ConversionReport, ConversionStage, UtilizationPoint,
@@ -45,8 +45,13 @@ async def sales_report(
     start_date = _range_to_start_date(range)
     query = (
         select(func.to_char(Payment.date, "YYYY-MM").label("month"),
-               func.coalesce(func.sum(Payment.amount_paid), 0))
-        .join(Client, Payment.client_id == Client.id)
+               func.coalesce(func.sum(Payment.amount), 0))
+        .join(SessionModel, Payment.session_id == SessionModel.id)
+        .outerjoin(Client, SessionModel.client_id == Client.id)
+        # Money received, not money billed. Every payment row used to be a
+        # receipt, so an unfiltered sum was the same thing; a PENDING row is
+        # not, and a CANCELLED one never will be.
+        .where(Payment.status.in_(COLLECTED_STATUSES))
     )
     if location_id:
         query = query.where(Client.location_id == location_id)
@@ -66,7 +71,7 @@ async def _lead_status_counts(db, location_id, start_date):
         query = query.where(Lead.created_at >= start_date)
     result = await db.execute(query)
     counts = {row[0]: row[1] for row in result.all()}
-    return {s: counts.get(s, 0) for s in LeadStatus}
+    return {s: counts.get(s, 0) for s in ContactStatus}
 
 
 @router.get("/clients", response_model=list[ClientStatusPoint])
@@ -177,11 +182,16 @@ async def revenue_by_therapist_report(
 ):
     start_date = _range_to_start_date(range)
     query = (
-        select(Therapist.id, Therapist.name, func.coalesce(func.sum(Payment.amount_paid), 0))
-        .join(Client, Client.therapist_id == Therapist.id)
-        .join(Payment, Payment.client_id == Client.id)
+        select(Therapist.id, Therapist.name, func.coalesce(func.sum(Payment.amount), 0))
+        # Through the SESSION's therapist, not the client's assigned one.
+        # Revenue by therapist should credit whoever delivered the session; the
+        # old join credited the client's standing therapist, which differs
+        # whenever a session is covered by someone else.
+        .outerjoin(SessionModel, SessionModel.therapist_id == Therapist.id)
+        .join(Payment, Payment.session_id == SessionModel.id)
+        .where(Payment.status.in_(COLLECTED_STATUSES))
         .group_by(Therapist.id, Therapist.name)
-        .order_by(func.sum(Payment.amount_paid).desc())
+        .order_by(func.sum(Payment.amount).desc())
     )
     if location_id:
         query = query.where(Therapist.location_id == location_id)
