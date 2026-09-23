@@ -1,0 +1,83 @@
+{
+  "family": "fbt-backend",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "runtimePlatform": {
+    "cpuArchitecture": "X86_64",
+    "operatingSystemFamily": "LINUX"
+  },
+  "executionRoleArn": "arn:aws:iam::<AWS_ACCOUNT_ID>:role/fbt-ecs-task-execution",
+  "taskRoleArn": "arn:aws:iam::<AWS_ACCOUNT_ID>:role/fbt-backend-task",
+  "volumes": [
+    { "name": "tmp" }
+  ],
+  "containerDefinitions": [
+    {
+      "name": "fbt-backend",
+      "image": "<AWS_ACCOUNT_ID>.dkr.ecr.<AWS_REGION>.amazonaws.com/fbt-backend:placeholder",
+      "essential": true,
+      "readonlyRootFilesystem": true,
+      "mountPoints": [
+        { "sourceVolume": "tmp", "containerPath": "/tmp", "readOnly": false }
+      ],
+      "portMappings": [
+        { "containerPort": 8000, "protocol": "tcp", "name": "http", "appProtocol": "http" }
+      ],
+      "stopTimeout": 30,
+      "environment": [
+        { "name": "ENVIRONMENT", "value": "production" },
+        { "name": "WEB_CONCURRENCY", "value": "1" },
+        { "name": "PORT", "value": "8000" },
+
+        { "name": "EMAIL_SERVICE", "value": "true" },
+        { "name": "SMTP_HOST", "value": "email-smtp.<AWS_REGION>.amazonaws.com" },
+        { "name": "SMTP_PORT", "value": "587" },
+        { "name": "SMTP_FROM_EMAIL", "value": "no-reply@freshbreaththerapy.com" },
+
+        { "name": "FRONTEND_URL", "value": "https://<PRODUCTION_FRONTEND_HOST>" },
+        { "name": "ALLOWED_ORIGINS", "value": "https://<PRODUCTION_FRONTEND_HOST>" },
+        { "name": "GOOGLE_REDIRECT_URI", "value": "https://<PRODUCTION_API_HOST>/api/auth/google/callback" },
+        { "name": "ALLOWED_GOOGLE_DOMAINS", "value": "freshbreaththerapy.com,ecommercecollections.com" },
+
+        { "name": "DB_TRANSACTION_POOLER", "value": "false" },
+        { "name": "DB_POOL_SIZE", "value": "5" },
+        { "name": "DB_MAX_OVERFLOW", "value": "5" },
+        { "name": "DB_ECHO", "value": "false" }
+      ],
+      "secrets": [
+        { "name": "DATABASE_URL",           "valueFrom": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:fbt/backend-XXXXXX:DATABASE_URL::" },
+        { "name": "MIGRATION_DATABASE_URL", "valueFrom": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:fbt/backend-XXXXXX:MIGRATION_DATABASE_URL::" },
+        { "name": "SECRET_KEY",             "valueFrom": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:fbt/backend-XXXXXX:SECRET_KEY::" },
+        { "name": "GOOGLE_CLIENT_ID",       "valueFrom": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:fbt/backend-XXXXXX:GOOGLE_CLIENT_ID::" },
+        { "name": "GOOGLE_CLIENT_SECRET",   "valueFrom": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:fbt/backend-XXXXXX:GOOGLE_CLIENT_SECRET::" },
+        { "name": "SMTP_USER",              "valueFrom": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:fbt/backend-XXXXXX:SMTP_USER::" },
+        { "name": "SMTP_PASSWORD",          "valueFrom": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:fbt/backend-XXXXXX:SMTP_PASSWORD::" },
+        { "name": "LEAD_WEBHOOK_SECRET",    "valueFrom": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:fbt/backend-XXXXXX:LEAD_WEBHOOK_SECRET::" },
+        { "name": "CRON_SECRET",            "valueFrom": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:fbt/backend-XXXXXX:CRON_SECRET::" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/fbt-backend",
+          "awslogs-region": "<AWS_REGION>",
+          "awslogs-stream-prefix": "ecs",
+          "awslogs-create-group": "false",
+          "mode": "non-blocking",
+          "max-buffer-size": "4m"
+        }
+      },
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4)\" || exit 1"
+        ],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 30
+      }
+    }
+  ]
+}

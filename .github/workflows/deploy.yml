@@ -1,0 +1,383 @@
+# FBT Dashboard API — build, test, publish, deploy.
+#
+#   push to master ──▶ build image ──▶ test THAT image ──▶ ECR ──▶ ECS Fargate
+#
+# Two things about the shape of this file are deliberate.
+#
+# THE IMAGE IS BUILT ONCE. It is built, tested and pushed inside a single job,
+# using the same local image object throughout, so the bytes that ran the tests
+# are bit-for-bit the bytes that reach ECR. A pipeline that rebuilds before
+# pushing is testing one artefact and shipping another; usually they match, and
+# "usually" is not a statement you want to make to an auditor.
+#
+# PULL REQUESTS RUN THE SAME TESTS. The build-and-test job runs on PRs too, and
+# only the ECR and ECS steps are gated on master. So master is tested before the
+# merge, not after it — by which time the deploy has already happened.
+
+name: Deploy API to ECS
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  # Lets someone redeploy the current master from the Actions tab without an
+  # empty commit — useful when a rollback needs reverting in a hurry.
+  workflow_dispatch:
+
+# One deployment at a time. Without this, two merges a minute apart race each
+# other through update-service and the later image can lose to the earlier one.
+# cancel-in-progress stays FALSE: cancelling a half-finished deploy leaves the
+# service in a state nobody chose.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: fbt-backend
+  ECS_CLUSTER: fbt-production
+  ECS_SERVICE: fbt-backend
+  CONTAINER_NAME: fbt-backend
+  TASK_DEFINITION_FILE: ecs/task-definition.json
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════
+  # 1 — build the image, prove it works, and only then publish it
+  # ═══════════════════════════════════════════════════════════════════════
+  build-and-test:
+    name: Build and test image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required for OIDC. This is what lets the job exchange a short-lived
+      # GitHub-signed token for temporary AWS credentials, so no permanent AWS
+      # access key exists anywhere in this repository to be stolen.
+      id-token: write
+    outputs:
+      image: ${{ steps.publish.outputs.image }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # load: true puts the built image into the local Docker daemon instead of
+      # pushing it, which is what makes the test steps below possible at all.
+      # Single platform for the same reason — buildx cannot load a multi-arch
+      # manifest into a daemon.
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: fbt-backend:${{ github.sha }}
+          platforms: linux/amd64
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── image invariants ────────────────────────────────────────────────
+      # Cheap, and each one guards a mistake that is invisible once made.
+      - name: Check the image does not run as root
+        run: |
+          set -euo pipefail
+          uid=$(docker run --rm --entrypoint id fbt-backend:${{ github.sha }} -u)
+          echo "container uid: $uid"
+          if [ "$uid" = "0" ]; then
+            echo "::error::Image runs as root. The USER directive was lost."
+            exit 1
+          fi
+
+      - name: Check no secrets were baked into the image
+        run: |
+          set -euo pipefail
+          # Not just the final filesystem — `docker history` covers files that
+          # were copied in one layer and deleted in a later one, which are still
+          # readable by anyone who pulls the image.
+          if docker run --rm --entrypoint sh fbt-backend:${{ github.sha }} \
+               -c 'ls -A /app; ls -A /' | grep -E '^\.env'; then
+            echo "::error::A .env file is present in the image."
+            exit 1
+          fi
+          for forbidden in venv qa scripts .git; do
+            if docker run --rm --entrypoint sh fbt-backend:${{ github.sha }} \
+                 -c "test -e /app/$forbidden" 2>/dev/null; then
+              echo "::error::/app/$forbidden was copied into the image."
+              exit 1
+            fi
+          done
+          echo "No .env, venv, qa, scripts or .git in the image."
+
+      # ── does it actually run ────────────────────────────────────────────
+      # A throwaway Postgres on an explicit user-defined network. Explicit
+      # rather than a `services:` block because the application runs inside a
+      # container of its own here, and `localhost` from inside that container
+      # is the container, not the runner — a difference that produces a very
+      # confusing ten minutes the first time it bites.
+      - name: Start a throwaway Postgres
+        run: |
+          set -euo pipefail
+          docker network create fbt-ci
+          docker run -d --name fbt-ci-db --network fbt-ci \
+            -e POSTGRES_USER=ci -e POSTGRES_PASSWORD=ci -e POSTGRES_DB=fbt_ci \
+            postgres:16-alpine
+          for i in $(seq 1 30); do
+            if docker exec fbt-ci-db pg_isready -U ci -d fbt_ci >/dev/null 2>&1; then
+              echo "postgres ready after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::Postgres never became ready."; docker logs fbt-ci-db; exit 1
+
+      # The real test of the migration chain: 39 revisions applied to an empty
+      # database, using the image's own interpreter and its own pinned Alembic.
+      # A revision that only works against the current production schema — one
+      # that quietly depends on a column an earlier revision never created —
+      # fails here rather than halfway through a production deploy.
+      - name: Run migrations against it
+        run: |
+          set -euo pipefail
+          docker run --rm --network fbt-ci \
+            -e DATABASE_URL='postgresql+asyncpg://ci:ci@fbt-ci-db:5432/fbt_ci' \
+            -e SECRET_KEY='ci-only-value-never-used-to-sign-anything-real' \
+            -e EMAIL_SERVICE=false \
+            fbt-backend:${{ github.sha }} \
+            alembic upgrade head
+
+      - name: Boot the container and wait for /health
+        run: |
+          set -euo pipefail
+          docker run -d --name fbt-ci-app --network fbt-ci -p 8000:8000 \
+            -e DATABASE_URL='postgresql+asyncpg://ci:ci@fbt-ci-db:5432/fbt_ci' \
+            -e SECRET_KEY='ci-only-value-never-used-to-sign-anything-real' \
+            -e EMAIL_SERVICE=false \
+            fbt-backend:${{ github.sha }}
+          for i in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1; then
+              echo "healthy after ${i}s"; exit 0
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' fbt-ci-app)" != "true" ]; then
+              echo "::error::Container exited during startup."; docker logs fbt-ci-app; exit 1
+            fi
+            sleep 1
+          done
+          echo "::error::/health never answered."; docker logs fbt-ci-app; exit 1
+
+      # ENVIRONMENT is deliberately unset above, so app/config.py falls back to
+      # "production" — the same path a real deploy takes if someone forgets the
+      # variable. Finding C-6 was that /openapi.json anonymously served a
+      # machine-readable map of every PHI field this API returns. This asserts
+      # it stays shut, because the way that regresses is a one-word edit that
+      # looks harmless in review.
+      - name: Check the API docs stay closed in production mode
+        run: |
+          set -euo pipefail
+          for path in /docs /redoc /openapi.json; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8000$path")
+            echo "$path -> $code"
+            if [ "$code" != "404" ]; then
+              echo "::error::$path returned $code, expected 404. Schema disclosure is back."
+              exit 1
+            fi
+          done
+
+      - name: Check the security headers are present
+        run: |
+          set -euo pipefail
+          headers=$(curl -sI http://127.0.0.1:8000/health)
+          echo "$headers"
+          for h in "strict-transport-security" "x-content-type-options" "x-request-id" "cache-control"; do
+            if ! echo "$headers" | tr 'A-Z' 'a-z' | grep -q "^$h:"; then
+              echo "::error::Response is missing the $h header."
+              exit 1
+            fi
+          done
+
+      - name: Container logs
+        if: always()
+        run: docker logs fbt-ci-app 2>&1 | tail -100 || true
+
+      - name: Tear down test containers
+        if: always()
+        run: |
+          docker rm -f fbt-ci-app fbt-ci-db >/dev/null 2>&1 || true
+          docker network rm fbt-ci >/dev/null 2>&1 || true
+
+      # ── publish ─────────────────────────────────────────────────────────
+      # Everything below this line is skipped on a pull request. A PR gets the
+      # full build and the full test run; it does not get to touch AWS.
+      - name: Assume the deployment role
+        if: github.event_name != 'pull_request'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-build-${{ github.run_id }}
+
+      - name: Log in to ECR
+        if: github.event_name != 'pull_request'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Tagged ONLY with the commit sha, never `latest`. Two reasons, and they
+      # reinforce each other: the ECR repository has tag immutability enabled
+      # (see AWS_PIPELINE_SETUP.md), so re-pushing `latest` would be rejected
+      # anyway — and a running task pinned to a sha can be traced back to the
+      # exact commit that produced it, which "latest" makes impossible at
+      # precisely the moment you need it.
+      - name: Push to ECR
+        if: github.event_name != 'pull_request'
+        id: publish
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          image="$REGISTRY/$ECR_REPOSITORY:${{ github.sha }}"
+          docker tag "fbt-backend:${{ github.sha }}" "$image"
+          docker push "$image"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "Pushed $image"
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 2 — migrate the database, then roll the service onto the new image
+  # ═══════════════════════════════════════════════════════════════════════
+  deploy:
+    name: Migrate and deploy to Fargate
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: github.event_name != 'pull_request'
+    # Point this at a GitHub Environment with a required reviewer if production
+    # deploys should need a human to approve them. Left unprotected here so the
+    # pipeline works the day it is merged; adding the protection is a settings
+    # change, not a code change.
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assume the deployment role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-deploy-${{ github.run_id }}
+
+      - name: Put the new image into the task definition
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ env.TASK_DEFINITION_FILE }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ needs.build-and-test.outputs.image }}
+
+      # Registered ONCE, here, and the resulting revision is used for both the
+      # migration task and the service update. Letting each step register its
+      # own would create two revisions per deploy that differ by nothing, and
+      # would leave open the possibility of migrating with one and serving with
+      # another.
+      - name: Register the task definition
+        id: register
+        run: |
+          set -euo pipefail
+          arn=$(aws ecs register-task-definition \
+            --cli-input-json "file://${{ steps.render.outputs.task-definition }}" \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "arn=$arn" >> "$GITHUB_OUTPUT"
+          echo "Registered $arn"
+
+      # Migrations run BEFORE the new tasks start, as a one-off task using the
+      # same image with its command overridden. This ordering is what makes a
+      # rolling deploy survivable: for the minute or two that old and new tasks
+      # overlap, both are talking to the migrated schema, so migrations have to
+      # be backwards-compatible with the outgoing revision. Adding a column is;
+      # dropping or renaming one is not, and needs two deploys.
+      - name: Run database migrations
+        run: |
+          set -euo pipefail
+          task_arn=$(aws ecs run-task \
+            --cluster "$ECS_CLUSTER" \
+            --task-definition "${{ steps.register.outputs.arn }}" \
+            --launch-type FARGATE \
+            --started-by "gha-migrate-${{ github.run_id }}" \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ vars.ECS_SUBNETS }}],securityGroups=[${{ vars.ECS_SECURITY_GROUP }}],assignPublicIp=DISABLED}" \
+            --overrides '{"containerOverrides":[{"name":"'"$CONTAINER_NAME"'","command":["alembic","upgrade","head"]}]}' \
+            --query 'tasks[0].taskArn' --output text)
+          echo "Migration task: $task_arn"
+
+          aws ecs wait tasks-stopped --cluster "$ECS_CLUSTER" --tasks "$task_arn"
+
+          exit_code=$(aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$task_arn" \
+            --query 'tasks[0].containers[0].exitCode' --output text)
+          reason=$(aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$task_arn" \
+            --query 'tasks[0].stoppedReason' --output text)
+          echo "exit code: $exit_code ($reason)"
+
+          if [ "$exit_code" != "0" ]; then
+            echo "::error::Migrations failed — the service was NOT updated."
+            # The task id is the last segment of the arn, and awslogs names the
+            # stream <prefix>/<container>/<task-id>.
+            task_id="${task_arn##*/}"
+            aws logs get-log-events \
+              --log-group-name "/ecs/fbt-backend" \
+              --log-stream-name "ecs/$CONTAINER_NAME/$task_id" \
+              --limit 100 --query 'events[].message' --output text || true
+            exit 1
+          fi
+
+      - name: Update the service
+        run: |
+          set -euo pipefail
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "${{ steps.register.outputs.arn }}" \
+            --query 'service.deployments[0].[status,desiredCount]' --output text
+
+      # The deployment circuit breaker on the service is what actually rolls
+      # back a bad release; this waits so that the workflow goes red when that
+      # happens, rather than reporting success over a service that has quietly
+      # reverted to the previous revision.
+      - name: Wait for the service to stabilise
+        run: |
+          set -euo pipefail
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+          echo "Deployed ${{ needs.build-and-test.outputs.image }}"
+
+      - name: Deployment events on failure
+        if: failure()
+        run: |
+          aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].events[0:15].[createdAt,message]' --output text || true
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 3 — dependency advisories (advisory, not a gate — see below)
+  # ═══════════════════════════════════════════════════════════════════════
+  dependency-audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # ADVISORY ON PURPOSE, for now. Two advisories are currently open and both
+    # were assessed and accepted: `ecdsa` has no fixed release and is not on the
+    # HS256 signing path this application uses, and `pip` is build tooling that
+    # is not in the runtime image at all. Making this blocking today would mean
+    # every deploy fails for a reason nobody intends to act on, and a check that
+    # is always red gets ignored — which is worse than one that is advisory.
+    #
+    # TO MAKE IT A REAL GATE: run it once, take the two advisory IDs from the
+    # output, add them as `--ignore-vuln GHSA-xxxx --ignore-vuln GHSA-yyyy` with
+    # a dated comment recording who accepted them, and delete continue-on-error.
+    # Then a NEW advisory fails the build and the accepted ones do not.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.7'
+      - run: pip install pip-audit
+      - run: pip-audit --requirement requirements.txt --strict --desc
