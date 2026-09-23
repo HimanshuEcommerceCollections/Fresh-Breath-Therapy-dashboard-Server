@@ -1,0 +1,42 @@
+# What may enter the build context — an ALLOWLIST, not a list of exclusions.
+#
+# Written this way deliberately. A denylist ("ignore .env, ignore venv/") only
+# protects against the files somebody thought of on the day they wrote it; the
+# next secret added to this repo is included by default and nobody notices.
+# Starting from `*` inverts that: a new file is OUT until someone deliberately
+# lets it in, and letting it in is a line in a diff a reviewer can see.
+#
+# This matters more than usual here because a Docker layer is permanent. A file
+# copied in one layer and deleted in a later one is STILL IN THE IMAGE — the
+# delete only hides it from the final filesystem view. Anyone who pulls the
+# image can read it back out of the earlier layer. So `.env` must never be
+# copied in the first place; removing it afterwards would not help.
+*
+
+# ── what the running application actually needs ───────────────────────────
+!app/
+!alembic/
+!alembic.ini
+!requirements.txt
+
+# ── re-excluded, having been swept in by the directory rules above ────────
+# Last match wins, so these come after the re-inclusions.
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+
+# ── never, under any circumstances ────────────────────────────────────────
+# Already covered by `*`, repeated so that the intent is explicit and so that
+# a future `!` line cannot quietly undo it without a reviewer noticing.
+.env
+.env.*
+.env.example
+venv/
+.git/
+.github/
+qa/
+scripts/
+*.md
+*.log
+*.pdf
+*.json
