@@ -1,0 +1,13 @@
+# These files are read by Linux tooling — Docker's build and dockerignore
+# parsers, and bash inside GitHub Actions runners — but are edited on Windows,
+# where git's autocrlf would otherwise commit them with CRLF. A stray \r
+# survives into a .dockerignore pattern or a shell line and the failure is
+# baffling: the pattern silently stops matching, or bash reports
+# "$'\r': command not found".
+Dockerfile          text eol=lf
+.dockerignore       text eol=lf
+.gitattributes      text eol=lf
+*.sh                text eol=lf
+*.yml               text eol=lf
+*.yaml              text eol=lf
+ecs/*.json          text eol=lf
