@@ -1162,7 +1162,16 @@ async def commit_import(
             processed=0, created=0, updated=0, failed=0, remaining=0, done=True,
             batch=ImportBatchSummary.model_validate(batch),
         )
-    if batch.status not in (ImportStatus.PREVIEW.value, ImportStatus.COMMITTING.value):
+    # QUEUED is accepted: a queued batch's client keeps calling this endpoint,
+    # and each call either reports its place in line again or — once nothing
+    # else is writing this entity — claims the run and starts writing.
+    # Refusing it here meant a queued import could never start from its own
+    # polling, only from a manual Resume after the batch ahead finished.
+    if batch.status not in (
+        ImportStatus.PREVIEW.value,
+        ImportStatus.COMMITTING.value,
+        ImportStatus.QUEUED.value,
+    ):
         raise HTTPException(
             status_code=409,
             detail="Review the preview before committing this import.",
