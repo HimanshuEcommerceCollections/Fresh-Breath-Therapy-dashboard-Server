@@ -8,6 +8,8 @@ from app.database import get_db
 from app.models.user import User
 from app.models.role import Role
 from app.models.therapist import Therapist
+from app.models.client import Client
+from app.models.payment import Payment
 from app.schemas.auth import LoginRequest
 from app.schemas.user import UserCreate, UserResponse
 from app.services.security import verify_password, hash_password
@@ -16,7 +18,9 @@ from app.dependencies.auth import get_current_user, require_admin
 from app.dependencies.idempotency import idempotent
 from datetime import datetime, timezone
 from app.models.role_request import RoleRequest, RoleRequestStatus
-from app.schemas.role_request import SignupRequest, ApproveRoleRequest, RoleRequestResponse
+from app.schemas.role_request import (
+    SignupRequest, ApproveRoleRequest, ChangeRoleRequest, RoleRequestResponse,
+)
 from app.services.otp_service import (
     OTP_TTL_MINUTES, request_otp, resolve_ticket, verify_otp,
 )
@@ -403,6 +407,80 @@ async def revoke_user_sessions(
     await db.commit()
 
 
+async def _attach_linked_therapists(db: AsyncSession, requests: list[RoleRequest]) -> None:
+    """Fill RoleRequestResponse.linked_therapist for a page of requests.
+
+    One query for the whole list, not one per row. A transient attribute
+    rather than a User relationship, so get_current_user — which every request
+    pays for — never learns about therapists.
+    """
+    user_ids = [r.user_id for r in requests]
+    linked: dict[uuid.UUID, Therapist] = {}
+    if user_ids:
+        result = await db.execute(select(Therapist).where(Therapist.user_id.in_(user_ids)))
+        linked = {t.user_id: t for t in result.scalars().all()}
+    for r in requests:
+        r.linked_therapist = linked.get(r.user_id)
+
+
+async def _role_request_response(db: AsyncSession, request_id: uuid.UUID) -> RoleRequest:
+    # populate_existing: the session does not expire on commit, so without it
+    # a relationship loaded before the change would be served stale.
+    result = await db.execute(
+        select(RoleRequest)
+        .options(selectinload(RoleRequest.user), selectinload(RoleRequest.requested_role))
+        .where(RoleRequest.id == request_id)
+        .execution_options(populate_existing=True)
+    )
+    req = result.scalar_one()
+    await _attach_linked_therapists(db, [req])
+    return req
+
+
+async def _link_therapist_for_role(db: AsyncSession, target_user: User, role: Role) -> None:
+    """Email-based Therapist linking, shared by approval and role changes.
+
+    REQUIRED for the Therapist role (blocked without a linkable record),
+    best-effort for Admin/Coordinator (linked if possible, never blocks).
+    Moving an account away from Therapist leaves an existing link in place: a
+    therapist may hold any role — the CEO is a therapist with Admin access —
+    and her therapist record stays tied to her account whatever the role.
+    """
+    result = await db.execute(
+        select(Therapist).where(Therapist.email == target_user.email)
+    )
+    therapist = result.scalar_one_or_none()
+
+    if role.name == "Therapist":
+        if therapist is None:
+            raise HTTPException(
+                status_code=400,
+                detail="No therapist record found with this email. Please create a therapist record with this email before approving this request.",
+            )
+        if therapist.user_id is not None and therapist.user_id != target_user.id:
+            raise HTTPException(
+                status_code=400,
+                detail="This therapist record is already linked to another user account.",
+            )
+        therapist.user_id = target_user.id
+        therapist.ever_linked = True
+    elif therapist is not None and therapist.user_id is None:
+        therapist.user_id = target_user.id
+        therapist.ever_linked = True
+
+
+def _assert_not_self(target_user: User, current_user: User) -> None:
+    # An admin demoting or deleting their own account is almost always a
+    # misclick, and strands them on a page they can no longer use. This is
+    # also what guarantees an Admin always remains: the caller is one, and
+    # can only ever act on somebody else.
+    if target_user.id == current_user.id:
+        raise HTTPException(
+            status_code=400,
+            detail="You cannot change or remove your own account access. Ask another Admin to do it.",
+        )
+
+
 @router.get("/role-requests", response_model=list[RoleRequestResponse])
 async def list_role_requests(
     status_filter: RoleRequestStatus | None = None,
@@ -415,7 +493,9 @@ async def list_role_requests(
     if status_filter:
         query = query.where(RoleRequest.status == status_filter)
     result = await db.execute(query.order_by(RoleRequest.created_at))
-    return result.scalars().all()
+    requests = list(result.scalars().all())
+    await _attach_linked_therapists(db, requests)
+    return requests
 
 
 @router.post("/role-requests/{request_id}/approve", response_model=RoleRequestResponse)
@@ -439,30 +519,7 @@ async def approve_role_request(
 
     target_user = await db.get(User, req.user_id)
 
-    # Email-based Therapist linking runs for every approval: REQUIRED for the
-    # Therapist role (approval blocked without a linkable record), best-effort
-    # for Admin/Coordinator (linked if possible, never blocks approval).
-    result = await db.execute(
-        select(Therapist).where(Therapist.email == target_user.email)
-    )
-    therapist = result.scalar_one_or_none()
-
-    if role.name == "Therapist":
-        if therapist is None:
-            raise HTTPException(
-                status_code=400,
-                detail="No therapist record found with this email. Please create a therapist record with this email before approving this request.",
-            )
-        if therapist.user_id is not None and therapist.user_id != target_user.id:
-            raise HTTPException(
-                status_code=400,
-                detail="This therapist record is already linked to another user account.",
-            )
-        therapist.user_id = target_user.id
-        therapist.ever_linked = True
-    elif therapist is not None and therapist.user_id is None:
-        therapist.user_id = target_user.id
-        therapist.ever_linked = True
+    await _link_therapist_for_role(db, target_user, role)
 
     target_user.role_id = role.id
 
@@ -472,11 +529,44 @@ async def approve_role_request(
     req.reviewed_at = datetime.now(timezone.utc)
 
     await db.commit()
-    result = await db.execute(
-        select(RoleRequest).options(selectinload(RoleRequest.user), selectinload(RoleRequest.requested_role))
-        .where(RoleRequest.id == request_id)
-    )
-    return result.scalar_one()
+    return await _role_request_response(db, request_id)
+
+
+@router.patch("/role-requests/{request_id}/role", response_model=RoleRequestResponse)
+async def change_approved_role(
+    request_id: uuid.UUID,
+    payload: ChangeRoleRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin()),
+):
+    """Move an already-approved account to a different role.
+
+    Takes effect on the user's very next request: get_current_user reads the
+    role from the database every time, it is not baked into the token.
+    """
+    req = await db.get(RoleRequest, request_id)
+    if req is None:
+        raise HTTPException(status_code=404, detail="Request not found")
+    if req.status != RoleRequestStatus.APPROVED:
+        raise HTTPException(status_code=400, detail="Only an approved request can have its role changed")
+
+    role = await db.get(Role, payload.role_id)
+    if role is None:
+        raise HTTPException(status_code=400, detail="Role does not exist")
+
+    target_user = await db.get(User, req.user_id)
+    _assert_not_self(target_user, current_user)
+
+    if target_user.role_id != role.id:
+        await _link_therapist_for_role(db, target_user, role)
+
+        target_user.role_id = role.id
+        req.requested_role_id = role.id
+        req.reviewed_by = current_user.id
+        req.reviewed_at = datetime.now(timezone.utc)
+        await db.commit()
+
+    return await _role_request_response(db, request_id)
 
 
 @router.delete("/role-requests/{request_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -485,15 +575,50 @@ async def reject_and_delete_user(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_admin()),
 ):
-    """Rejecting a signup means the account was fraudulent/unwanted —
-    delete the user entirely, not just the request."""
+    """Reject a pending signup, or revoke an approved one. Either way the user
+    account is deleted entirely, not just the request, so the email is free to
+    sign up again.
+
+    An approved account linked to a therapist who is still active is refused
+    with a 409: the therapist must be marked inactive first, so access is
+    never pulled from someone the clinic still schedules sessions for.
+    """
     req = await db.get(RoleRequest, request_id)
     if req is None:
         raise HTTPException(status_code=404, detail="Request not found")
-    if req.status != RoleRequestStatus.PENDING:
-        raise HTTPException(status_code=400, detail="Request already reviewed")
 
     target_user = await db.get(User, req.user_id)
+
+    if req.status != RoleRequestStatus.PENDING and target_user is not None:
+        _assert_not_self(target_user, current_user)
+
+        result = await db.execute(select(Therapist).where(Therapist.user_id == target_user.id))
+        therapist = result.scalar_one_or_none()
+        if therapist is not None and therapist.is_active:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "therapist_active",
+                    "message": (
+                        f"Request failed: this account is linked to therapist {therapist.name}, "
+                        "who is still active. Mark the therapist inactive first, then remove this account."
+                    ),
+                    "therapist": {"id": str(therapist.id), "name": therapist.name},
+                },
+            )
+        if therapist is not None:
+            # The FK would SET NULL on its own; doing it here puts the unlink
+            # in the audit trail. ever_linked stays True — the history is real.
+            therapist.user_id = None
+
+        # Columns that only record "who did this" reference users with no
+        # ON DELETE rule, so they would block the delete. Cleared through the
+        # ORM so each change is audited; the audit log keeps the actor's name.
+        for column in (Payment.created_by, Client.user_id, RoleRequest.reviewed_by):
+            rows = await db.execute(select(column.class_).where(column == target_user.id))
+            for row in rows.scalars().all():
+                setattr(row, column.key, None)
+        await db.flush()
 
     await db.delete(req)
     if target_user is not None:
