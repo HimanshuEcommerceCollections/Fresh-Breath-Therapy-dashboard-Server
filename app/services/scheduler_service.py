@@ -9,6 +9,7 @@ from app.services.notification_service import create_notification
 from app.services.audit_context import install_context, reset_context, system_context
 from app.services.audit_service import purge_expired, record_read
 from app.services.retention_service import run_retention_sweep
+from app.services.session_email_service import send_due_reminders
 from app.config import settings
 from app.models.notification import NotificationCategory, NotificationBadge
 from app.models.client import Client
@@ -100,6 +101,10 @@ async def run_notification_scan():
         async with AsyncSessionLocal() as db:
             follow_up_ids = await _scan_follow_ups(db)
             session_ids = await _scan_sessions(db)
+            # Day-before reminder emails to clients and leads. Its reads are
+            # already covered: every session it looks at is SCHEDULED, which
+            # _scan_sessions has just recorded.
+            await send_due_reminders(db)
             if follow_up_ids:
                 await record_read(db, "follow_up", entity_ids=follow_up_ids,
                                   criteria={"job": "notification_scan"})
