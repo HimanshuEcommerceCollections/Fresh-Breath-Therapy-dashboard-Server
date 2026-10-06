@@ -64,6 +64,15 @@ def _assert_may_hold_session(user: User) -> None:
         raise HTTPException(status_code=403, detail="Account is inactive")
 
 
+def _assert_domain_allowed(email: str) -> None:
+    # Only enforced when DOMAIN_ALLOWANCE is on — see config.py.
+    if not settings.email_domain_allowed(email):
+        raise HTTPException(
+            status_code=403,
+            detail="Sign-in with this email domain is not allowed for this dashboard.",
+        )
+
+
 def _mask_email(email: str) -> str:
     """"kristen@fbtclinic.com" -> "k*****@fbtclinic.com".
 
@@ -100,6 +109,7 @@ async def login(
     response: Response,
     db: AsyncSession = Depends(get_db),
 ):
+    _assert_domain_allowed(credentials.email)
     result = await db.execute(
         select(User).options(selectinload(User.role)).where(User.email == credentials.email)
     )
@@ -321,6 +331,7 @@ async def signup(
     response: Response,
     db: AsyncSession = Depends(get_db),
 ):
+    _assert_domain_allowed(payload.email)
     existing = await db.execute(select(User).where(User.email == payload.email))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Email already registered")

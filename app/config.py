@@ -1,3 +1,4 @@
+import json
 import pathlib
 import re
 from pydantic_settings import BaseSettings
@@ -42,16 +43,20 @@ class Settings(BaseSettings):
     CLOUDINARY_API_SECRET: str | None = None
     GOOGLE_CLIENT_ID: str | None = None
     GOOGLE_CLIENT_SECRET: str | None = None
-    # Comma-separated Google Workspace domains permitted to sign in, e.g.
-    # "freshbreaththerapy.com".
+    # Email-domain restriction for signing up and signing in — password and
+    # Google alike. Off by default: any email domain may sign up, and an admin
+    # still has to approve every new account before it can do anything.
     #
-    # FAILS CLOSED when unset: Google sign-in is REFUSED entirely rather than
-    # allowing any Google account on earth to complete the flow and land in the
-    # pending-approval queue. That matches the two settings above — CRON_SECRET
-    # and LEAD_WEBHOOK_SECRET both refuse every request when unconfigured — and
-    # it is the same reasoning: an unset security setting must not read as
-    # "allow all". Password sign-in is unaffected, so an unset value locks
-    # nobody out of the application, only out of the Google button.
+    # DOMAIN_ALLOWANCE=true turns it on, and DOMAIN lists the domains allowed,
+    # as a JSON array or comma-separated:
+    #   DOMAIN=["freshbreaththerapy.com","ecommercecollections.com"]
+    #   DOMAIN=freshbreaththerapy.com,ecommercecollections.com
+    # On with an empty list refuses everyone (fails closed).
+    DOMAIN_ALLOWANCE: bool = False
+    DOMAIN: str | None = None
+    # Deprecated: the old Google-only allowlist. Still read (merged into DOMAIN)
+    # so a deployment that has it set keeps booting — extra="forbid" would
+    # refuse to start if it were removed while still configured.
     ALLOWED_GOOGLE_DOMAINS: str | None = None
     GOOGLE_REDIRECT_URI: str = "https://fresh-breath-therapy-dashboard-serv.vercel.app/api/auth/google/callback"
     FRONTEND_URL: str = "https://fresh-breath-therapy-dashboard-ui.vercel.app"
@@ -202,9 +207,31 @@ class Settings(BaseSettings):
         return re.sub(r"(?<=:)\d+(?=/[^/]*$)", str(port), url, count=1)
 
     @property
-    def allowed_google_domains(self) -> set[str]:
-        raw = self.ALLOWED_GOOGLE_DOMAINS or ""
-        return {d.strip().lower() for d in raw.split(",") if d.strip()}
+    def allowed_domains(self) -> set[str] | None:
+        """The email domains allowed to sign in, or None for "any domain"."""
+        if not self.DOMAIN_ALLOWANCE:
+            return None
+        domains: set[str] = set()
+        for raw in (self.DOMAIN, self.ALLOWED_GOOGLE_DOMAINS):
+            if not raw:
+                continue
+            raw = raw.strip()
+            try:
+                items = json.loads(raw) if raw.startswith("[") else raw.split(",")
+            except ValueError:
+                items = raw.strip("[]").split(",")
+            domains |= {
+                str(d).strip().strip("\"'").lstrip("@").lower()
+                for d in items if str(d).strip()
+            }
+        return domains
+
+    def email_domain_allowed(self, email: str, hosted_domain: str | None = None) -> bool:
+        allowed = self.allowed_domains
+        if allowed is None:
+            return True
+        email_domain = email.rsplit("@", 1)[-1].strip().lower()
+        return email_domain in allowed or (hosted_domain or "").strip().lower() in allowed
 
     @property
     def is_development(self) -> bool:

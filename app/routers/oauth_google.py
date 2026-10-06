@@ -36,13 +36,8 @@ def _login_error_redirect(reason: str) -> RedirectResponse:
 
 @router.get("/login")
 async def google_login():
-    # Checked here too, not only in the callback. Sending someone to Google and
-    # refusing them on the way back wastes their time and looks like a bug;
-    # refusing before the redirect tells them immediately.
-    if not settings.allowed_google_domains:
-        logger.error(
-            "Google sign-in refused: ALLOWED_GOOGLE_DOMAINS is not configured."
-        )
+    if not settings.GOOGLE_CLIENT_ID or not settings.GOOGLE_CLIENT_SECRET:
+        logger.error("Google sign-in refused: GOOGLE_CLIENT_ID/SECRET not configured.")
         return _login_error_redirect("google_not_configured")
 
     state = secrets.token_urlsafe(24)
@@ -107,33 +102,10 @@ async def google_callback(
         if not email or not email_verified:
             return _login_error_redirect("email_not_verified")
 
-        # Hosted-domain check. Without it any Google account can complete this
-        # flow and create a pending signup request, so rejecting strangers
-        # becomes manual work arriving by surprise.
-        #
-        # `hd` is the authoritative claim but only Workspace accounts carry it —
-        # a personal gmail.com login has none — so the address's own domain is
-        # the fallback.
-        allowed_domains = settings.allowed_google_domains
-        if not allowed_domains:
-            # FAIL CLOSED. An unconfigured allowlist previously meant "any
-            # Google account on earth", which turned rejecting strangers into
-            # manual work arriving by surprise. Refusing is the same choice
-            # CRON_SECRET and LEAD_WEBHOOK_SECRET already make when unset.
-            #
-            # Password sign-in still works, so this locks nobody out of the
-            # application — only out of the Google button, until somebody says
-            # which domains belong to the clinic.
-            logger.error(
-                "Google sign-in refused: ALLOWED_GOOGLE_DOMAINS is not configured."
-            )
-            return _login_error_redirect("google_not_configured")
-
-        hosted_domain = (profile.get("hd") or "").strip().lower()
-        email_domain = email.rsplit("@", 1)[-1].lower()
-        if hosted_domain not in allowed_domains and email_domain not in allowed_domains:
-            # The domain itself is not logged — it is an identifier, and the
-            # refusal is already recorded against the request id.
+        # Domain restriction — only when DOMAIN_ALLOWANCE is on (see config).
+        # `hd` is Google's own claim for Workspace accounts; the address's
+        # domain covers personal accounts, which carry no `hd`.
+        if not settings.email_domain_allowed(email, profile.get("hd")):
             logger.warning("Google sign-in refused: domain not on the allowlist")
             return _login_error_redirect("domain_not_allowed")
 
