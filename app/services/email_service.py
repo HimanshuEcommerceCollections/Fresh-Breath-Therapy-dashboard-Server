@@ -55,6 +55,24 @@ def send_session_scheduled_email(
     )
 
 
+def send_session_scheduled_therapist_email(
+    to_email: str, therapist_name: str, session_date: date, session_time: time, client_name: str
+) -> None:
+    when_date = session_date.strftime("%A, %B %d, %Y").replace(" 0", " ")
+    when_time = session_time.strftime("%I:%M %p").lstrip("0")
+    _send(
+        to_email,
+        f"New session scheduled: {when_date} at {when_time}",
+        f"Hi {therapist_name},\n\n"
+        f"A session has been scheduled with you:\n\n"
+        f"  Client:    {client_name}\n"
+        f"  Date:      {when_date}\n"
+        f"  Time:      {when_time} (Eastern Time)\n\n"
+        f"See the dashboard for details.\n\n"
+        f"— {CLINIC_NAME}",
+    )
+
+
 def send_session_reminder_email(
     to_email: str, name: str, session_date: date, session_time: time, therapist_name: str
 ) -> None:

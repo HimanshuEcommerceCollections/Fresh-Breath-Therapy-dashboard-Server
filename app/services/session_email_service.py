@@ -8,6 +8,7 @@ on every scan until it goes out or the session starts.
 Session times are clinic-local (Eastern), the same assumption the in-app
 appointment reminders in scheduler_service.py make.
 """
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -22,6 +23,7 @@ from app.models.enums import SessionStatus
 from app.models.session import Session
 from app.services.email_service import (
     send_session_reminder_email, send_session_scheduled_email,
+    send_session_scheduled_therapist_email,
 )
 
 logger = logging.getLogger(__name__)
@@ -49,22 +51,37 @@ def reminder_already_covered(session: Session, now: datetime | None = None) -> b
     return session_starts_at(session) - REMINDER_BEFORE <= now
 
 
+async def _send_logged(label: str, session_id, fn, *args) -> None:
+    try:
+        await run_in_threadpool(fn, *args)
+    except Exception:
+        logger.exception("Session %s email failed for session %s", label, session_id)
+
+
 async def send_scheduled_confirmation(session: Session) -> None:
-    """Confirmation for a just-booked session. Needs client, lead and
-    therapist loaded. Never raises."""
+    """Confirmation for a just-booked session, to the client or lead AND to
+    the therapist. Needs client, lead and therapist loaded. Never raises.
+
+    The two sends run concurrently: each is an SMTP round trip of a second or
+    more, and the admin is waiting on the booking response."""
     if not settings.EMAIL_SERVICE or session.status != SessionStatus.SCHEDULED:
         return
+    sends = []
     recipient = _recipient(session)
-    if recipient is None:
-        return
-    email, name = recipient
-    try:
-        await run_in_threadpool(
-            send_session_scheduled_email,
+    if recipient is not None:
+        email, name = recipient
+        sends.append(_send_logged(
+            "confirmation", session.id, send_session_scheduled_email,
             email, name, session.date, session.time, session.therapist.name,
-        )
-    except Exception:
-        logger.exception("Session confirmation email failed for session %s", session.id)
+        ))
+    if session.therapist.email:
+        subject = session.client or session.lead
+        sends.append(_send_logged(
+            "therapist confirmation", session.id, send_session_scheduled_therapist_email,
+            session.therapist.email, session.therapist.name, session.date, session.time,
+            subject.name if subject else "a client",
+        ))
+    await asyncio.gather(*sends)
 
 
 async def send_due_reminders(db: AsyncSession) -> list:
