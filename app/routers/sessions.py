@@ -18,6 +18,10 @@ from app.models.notification import NotificationCategory, NotificationBadge
 from app.models.user import User
 from app.dependencies.auth import get_current_user, require_admin, get_own_therapist
 from app.services.session_service import check_double_booking
+from app.services.session_email_service import (
+    reminder_already_covered, send_scheduled_confirmation,
+)
+from datetime import datetime, timezone
 from app.services.pto_service import accrue_pto_for_completed_session
 from app.dependencies.idempotency import idempotent
 from app.services.audit_service import record_denied_on, record_read
@@ -196,10 +200,19 @@ async def create_session(
             related_entity_type="session", related_entity_id=session.id, commit=False,
         )
 
+    # Booked less than 24 hours out: the confirmation below doubles as the
+    # reminder, so the scan must not send a second email minutes later.
+    if session.status == SessionStatus.SCHEDULED and reminder_already_covered(session):
+        session.reminder_sent_at = datetime.now(timezone.utc)
+
     await db.commit()
 
     result = await db.execute(_session_query().where(Session.id == session.id))
-    return result.scalar_one()
+    created = result.scalar_one()
+    # After the commit, so an email never announces a booking that rolled
+    # back. Best-effort: a failed send is logged, the booking still stands.
+    await send_scheduled_confirmation(created)
+    return created
 
 
 @router.patch("/{session_id}", response_model=SessionResponse)
@@ -260,6 +273,11 @@ async def update_session(
 
     for field, value in update_data.items():
         setattr(session, field, value)
+
+    # Moved to a new date or time: the reminder belongs to the new slot, so
+    # the scan sends it again 24 hours before that one.
+    if {"date", "time"} & update_data.keys():
+        session.reminder_sent_at = None
 
     if session.status == SessionStatus.COMPLETED and not previously_completed:
         await accrue_pto_for_completed_session(db, session.id, session.therapist_id)

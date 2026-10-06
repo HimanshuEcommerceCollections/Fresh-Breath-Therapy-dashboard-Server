@@ -66,6 +66,11 @@ class Session(Base):
         nullable=False,
         default=SessionStatus.SCHEDULED,
     )
+    # When the day-before reminder email was sent. Null = not sent yet; the
+    # notification scan sends it once, and moving the session clears it.
+    reminder_sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
