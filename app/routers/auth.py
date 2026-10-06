@@ -29,6 +29,7 @@ from app.schemas.otp import (
     VerifyOtpResponse,
 )
 from app.config import settings
+from app.startup import ensure_initial_admin, is_initial_admin_email
 from app.services.auth_cookie import (
     ACCESS_TOKEN_COOKIE, LOGIN_TICKET_COOKIE, clear_auth_cookie,
     clear_login_ticket_cookie, set_auth_cookie, set_login_ticket_cookie,
@@ -109,7 +110,14 @@ async def login(
     response: Response,
     db: AsyncSession = Depends(get_db),
 ):
-    _assert_domain_allowed(credentials.email)
+    if is_initial_admin_email(credentials.email):
+        # The owner account always exists as an active Admin with the env
+        # password — no signup, no approval, no domain check. The password
+        # itself is still verified below like anyone else's.
+        await ensure_initial_admin(db)
+        await db.commit()
+    else:
+        _assert_domain_allowed(credentials.email)
     result = await db.execute(
         select(User).options(selectinload(User.role)).where(User.email == credentials.email)
     )

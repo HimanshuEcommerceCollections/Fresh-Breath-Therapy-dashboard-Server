@@ -10,6 +10,7 @@ from sqlalchemy.orm import selectinload
 
 from app.database import get_db
 from app.config import settings
+from app.startup import ensure_initial_admin, is_initial_admin_email
 from app.models.user import User
 from app.models.role_request import RoleRequest, RoleRequestStatus
 from app.services.jwt_service import create_access_token
@@ -105,7 +106,12 @@ async def google_callback(
         # Domain restriction — only when DOMAIN_ALLOWANCE is on (see config).
         # `hd` is Google's own claim for Workspace accounts; the address's
         # domain covers personal accounts, which carry no `hd`.
-        if not settings.email_domain_allowed(email, profile.get("hd")):
+        if is_initial_admin_email(email):
+            # Google has just proved ownership of the owner address: make sure
+            # the account exists as an active Admin, then sign in as normal.
+            await ensure_initial_admin(db)
+            await db.commit()
+        elif not settings.email_domain_allowed(email, profile.get("hd")):
             logger.warning("Google sign-in refused: domain not on the allowlist")
             return _login_error_redirect("domain_not_allowed")
 
